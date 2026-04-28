@@ -17,10 +17,9 @@ from db import (
     update_simulation_job,
     get_persona,
     get_scenario,
-    get_metric,
     get_personas_for_simulation,
     get_scenarios_for_simulation,
-    get_metrics_for_simulation,
+    get_evaluators_for_simulation,
     get_simulation,
     get_queued_jobs,
     get_queued_agent_test_jobs,
@@ -472,10 +471,10 @@ def _recover_simulation_job(job_id: str, details: dict, job_type: str):
     if not agent:
         raise ValueError(f"Agent {agent_uuid} not found")
 
-    # Fetch personas, scenarios, and metrics
+    # Fetch personas, scenarios, and evaluators
     personas = get_personas_for_simulation(simulation_uuid)
     scenarios = get_scenarios_for_simulation(simulation_uuid)
-    metrics = get_metrics_for_simulation(simulation_uuid)
+    evaluators = get_evaluators_for_simulation(simulation_uuid)
 
     if not personas:
         raise ValueError(f"Simulation {simulation_uuid} has no personas")
@@ -484,7 +483,7 @@ def _recover_simulation_job(job_id: str, details: dict, job_type: str):
 
     thread = threading.Thread(
         target=run_simulation_task,
-        args=(job_id, agent, personas, scenarios, metrics, s3_bucket, job_type),
+        args=(job_id, agent, personas, scenarios, evaluators, s3_bucket, job_type),
         daemon=True,
     )
     thread.start()

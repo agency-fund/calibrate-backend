@@ -1,8 +1,21 @@
 from typing import ClassVar, Optional, List, Dict, Any, Literal
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
-from db import create_test, get_test, get_all_tests, update_test, delete_test, bulk_create_tests, bulk_delete_tests, get_agent, add_test_to_agent
+from db import (
+    create_test,
+    get_test,
+    get_all_tests,
+    update_test,
+    delete_test,
+    bulk_create_tests,
+    bulk_delete_tests,
+    get_agent,
+    add_test_to_agent,
+    get_evaluator,
+    get_evaluators_for_test,
+    set_test_evaluators,
+)
 from auth_utils import get_current_user_id
 
 import logging
@@ -13,16 +26,28 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tests", tags=["tests"])
 
 
+class EvaluatorRef(BaseModel):
+    """Reference to an evaluator attached to a test. The pinned version is always the
+    evaluator's live version at write time (`set_test_evaluators` in `db.py`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evaluator_uuid: str
+    variable_values: Optional[Dict[str, Any]] = None
+
+
 class TestCreate(BaseModel):
     name: str
     type: str
     config: Optional[Dict[str, Any]] = None
+    evaluators: Optional[List[EvaluatorRef]] = None
 
 
 class TestUpdate(BaseModel):
     name: Optional[str] = None
     type: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
+    evaluators: Optional[List[EvaluatorRef]] = None
 
 
 class TestResponse(BaseModel):
@@ -32,6 +57,7 @@ class TestResponse(BaseModel):
     config: Optional[Dict[str, Any]] = None
     created_at: str
     updated_at: str
+    evaluators: List[Dict[str, Any]] = []
 
 
 class TestCreateResponse(BaseModel):
@@ -58,7 +84,7 @@ class ExpectedToolCall(BaseModel):
 class BulkTestItem(BaseModel):
     name: str
     conversation_history: List[ChatMessage]
-    criteria: Optional[str] = None
+    evaluators: Optional[List[EvaluatorRef]] = None
     tool_calls: Optional[List[ExpectedToolCall]] = None
 
 
@@ -88,8 +114,10 @@ class BulkTestUpload(BaseModel):
             if not t.conversation_history:
                 raise ValueError(f"Test '{t.name}' must have at least one message in conversation_history")
             if self.type == "response":
-                if not t.criteria:
-                    raise ValueError(f"Test '{t.name}' must have 'criteria' for response type")
+                if not t.evaluators:
+                    raise ValueError(
+                        f"Test '{t.name}' must have at least one evaluator for response type"
+                    )
             elif self.type == "tool_call":
                 if not t.tool_calls:
                     raise ValueError(f"Test '{t.name}' must have 'tool_calls' for tool_call type")
@@ -111,6 +139,41 @@ class BulkTestDelete(BaseModel):
 class BulkTestDeleteResponse(BaseModel):
     deleted_count: int
     message: str
+
+
+def _validate_evaluators(refs: List[EvaluatorRef], user_id: str) -> List[Dict[str, Any]]:
+    """Validate that each referenced evaluator is visible to the user and that it has
+    `evaluator_type == 'llm'` (response/next-reply tests only judge LLM output, so attaching
+    a stt/tts/simulation evaluator is rejected at write time). Returns db-ready refs."""
+    out: List[Dict[str, Any]] = []
+    for ref in refs:
+        evaluator = get_evaluator(ref.evaluator_uuid)
+        if not evaluator:
+            raise HTTPException(status_code=404, detail=f"Evaluator {ref.evaluator_uuid} not found")
+        if evaluator.get("owner_user_id") is not None and evaluator["owner_user_id"] != user_id:
+            raise HTTPException(status_code=404, detail=f"Evaluator {ref.evaluator_uuid} not found")
+        if evaluator.get("evaluator_type") != "llm":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Evaluator {ref.evaluator_uuid} has evaluator_type="
+                    f"'{evaluator.get('evaluator_type')}'. LLM tests only accept 'llm' evaluators."
+                ),
+            )
+        out.append(
+            {
+                "evaluator_id": ref.evaluator_uuid,
+                "evaluator_version_id": None,
+                "variable_values": ref.variable_values,
+            }
+        )
+    return out
+
+
+def _with_evaluators(test_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach linked evaluators to a test dict."""
+    evaluators = get_evaluators_for_test(test_dict["uuid"])
+    return {**test_dict, "evaluators": evaluators}
 
 
 @router.post("/bulk-delete", response_model=BulkTestDeleteResponse)
@@ -142,12 +205,17 @@ async def bulk_upload_tests(
             if agent.get("user_id") != user_id:
                 raise HTTPException(status_code=403, detail=f"Access denied for agent {agent_uuid}")
 
+    resolved_evaluator_refs: List[Optional[List[Dict[str, Any]]]] = []
+    for t in payload.tests:
+        if t.evaluators:
+            resolved_evaluator_refs.append(_validate_evaluators(t.evaluators, user_id))
+        else:
+            resolved_evaluator_refs.append(None)
+
     db_tests = []
     for t in payload.tests:
         evaluation: Dict[str, Any] = {"type": payload.type}
-        if payload.type == "response":
-            evaluation["criteria"] = t.criteria
-        else:
+        if payload.type == "tool_call":
             evaluation["tool_calls"] = [tc.model_dump() for tc in t.tool_calls]
 
         config: Dict[str, Any] = {
@@ -167,6 +235,10 @@ async def bulk_upload_tests(
         uuids = bulk_create_tests(tests=db_tests, user_id=user_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    for test_uuid, refs in zip(uuids, resolved_evaluator_refs):
+        if refs:
+            set_test_evaluators(test_uuid, refs)
 
     warnings: List[str] = []
     if payload.agent_uuids:
@@ -200,12 +272,15 @@ async def create_test_endpoint(
     test: TestCreate, user_id: str = Depends(get_current_user_id)
 ):
     """Create a new test."""
+    resolved = _validate_evaluators(test.evaluators, user_id) if test.evaluators else None
     test_uuid = create_test(
         name=test.name,
         type=test.type,
         config=test.config,
         user_id=user_id,
     )
+    if resolved:
+        set_test_evaluators(test_uuid, resolved)
     return TestCreateResponse(uuid=test_uuid, message="Test created successfully")
 
 
@@ -213,7 +288,7 @@ async def create_test_endpoint(
 async def list_tests(user_id: str = Depends(get_current_user_id)):
     """List all tests for the authenticated user."""
     tests = get_all_tests(user_id=user_id)
-    return tests
+    return [_with_evaluators(t) for t in tests]
 
 
 @router.get("/{test_uuid}", response_model=TestResponse)
@@ -224,10 +299,9 @@ async def get_test_endpoint(
     test = get_test(test_uuid)
     if not test:
         raise HTTPException(status_code=404, detail="Test not found")
-    # Verify user owns this test
     if test.get("user_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    return test
+    return _with_evaluators(test)
 
 
 @router.put("/{test_uuid}", response_model=TestResponse)
@@ -238,23 +312,28 @@ async def update_test_endpoint(
     existing_test = get_test(test_uuid)
     if not existing_test:
         raise HTTPException(status_code=404, detail="Test not found")
-
-    # Verify user owns this test
     if existing_test.get("user_id") != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    updated = update_test(
-        test_uuid=test_uuid,
-        name=test.name,
-        type=test.type,
-        config=test.config,
+    resolved = _validate_evaluators(test.evaluators, user_id) if test.evaluators is not None else None
+
+    has_core_updates = any(
+        v is not None for v in (test.name, test.type, test.config)
     )
+    if has_core_updates:
+        updated = update_test(
+            test_uuid=test_uuid,
+            name=test.name,
+            type=test.type,
+            config=test.config,
+        )
+        if not updated and resolved is None:
+            raise HTTPException(status_code=400, detail="No fields to update")
 
-    if not updated:
-        raise HTTPException(status_code=400, detail="No fields to update")
+    if resolved is not None:
+        set_test_evaluators(test_uuid, resolved)
 
-    updated_test = get_test(test_uuid)
-    return updated_test
+    return _with_evaluators(get_test(test_uuid))
 
 
 @router.delete("/{test_uuid}")
@@ -262,7 +341,6 @@ async def delete_test_endpoint(
     test_uuid: str, user_id: str = Depends(get_current_user_id)
 ):
     """Delete a test."""
-    # Check if test exists and user owns it
     existing_test = get_test(test_uuid)
     if not existing_test:
         raise HTTPException(status_code=404, detail="Test not found")

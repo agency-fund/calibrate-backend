@@ -4,6 +4,7 @@ import signal
 import logging
 import threading
 import time
+import json
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -90,6 +91,16 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
 
 
+class EvaluatorRunEntry(BaseModel):
+    """One evaluator's aggregate metrics for an STT/TTS provider, paired with evaluator UUID."""
+
+    evaluator_uuid: str
+    metric_key: str  # key as emitted in metrics.json (derived from CLI/config at run time)
+    aggregate: Dict[str, Any]
+    name: Optional[str] = None  # filled on API read from DB + job snapshot
+    description: Optional[str] = None  # filled on API read from current DB row
+
+
 class ProviderResult(BaseModel):
     provider: str
     success: Optional[bool] = None  # None while in progress, True/False when done
@@ -97,6 +108,7 @@ class ProviderResult(BaseModel):
         None  # dict (new format) or list (backward compat)
     )
     results: Optional[List[Dict[str, Any]]] = None
+    evaluator_runs: Optional[List[EvaluatorRunEntry]] = None
 
 
 class TaskCreateResponse(BaseModel):
@@ -263,9 +275,45 @@ def upload_file_to_s3(
     """
     content_type, _ = mimetypes.guess_type(str(local_path))
     extra_args = {"ContentType": content_type} if content_type else None
-    s3_client.upload_file(
-        str(local_path), bucket, s3_key, ExtraArgs=extra_args
-    )
+    s3_client.upload_file(str(local_path), bucket, s3_key, ExtraArgs=extra_args)
+
+
+def upload_top_level_files_to_s3(
+    s3_client,
+    local_dir: Path,
+    bucket: str,
+    key_prefix: str,
+) -> None:
+    """Upload only regular files directly under ``local_dir`` (e.g. run-level ``logs``, ``leaderboard.csv``).
+
+    Subdirectories are ignored; use :func:`upload_directory_tree_to_s3` for a full tree.
+    """
+    if not local_dir or not local_dir.is_dir():
+        return
+    prefix = key_prefix.rstrip("/")
+    for p in local_dir.iterdir():
+        if p.is_file():
+            s3_key = f"{prefix}/{p.name}"
+            upload_file_to_s3(s3_client, p, bucket, s3_key)
+
+
+def upload_directory_tree_to_s3(
+    s3_client,
+    local_root: Path,
+    bucket: str,
+    key_prefix: str,
+) -> None:
+    """Recursively upload every file under ``local_root`` to ``s3://bucket/{key_prefix}/<relative>``."""
+    if not local_root or not local_root.exists():
+        return
+    local_root = local_root.resolve()
+    prefix = key_prefix.rstrip("/")
+    for root, dirs, files in os.walk(local_root):
+        for file in files:
+            local_file_path = Path(root) / file
+            relative_path = local_file_path.relative_to(local_root)
+            s3_key = f"{prefix}/{relative_path.as_posix()}"
+            upload_file_to_s3(s3_client, local_file_path, bucket, s3_key)
 
 
 def generate_presigned_download_url(
@@ -769,6 +817,105 @@ def normalize_metrics(metrics):
     return metrics
 
 
+def is_evaluator_metric_aggregate(value: Any) -> bool:
+    """True for nested evaluator outputs in metrics.json (excludes wer scalars, ttfb, etc.)."""
+    return isinstance(value, dict) and "type" in value
+
+
+def ordered_evaluator_metric_keys(metrics: Optional[Dict[str, Any]]) -> List[str]:
+    if not metrics or not isinstance(metrics, dict):
+        return []
+    return [k for k, v in metrics.items() if is_evaluator_metric_aggregate(v)]
+
+
+def read_evaluators_map_from_config(output_dir: Optional[Path]) -> Dict[str, str]:
+    """Read root config.json evaluators_map as {metric_key: evaluator_uuid}."""
+    if not output_dir:
+        return {}
+    config_path = output_dir / "config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to read evaluator map from {config_path}: {e}")
+        return {}
+
+    raw = config.get("evaluators_map")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(name): str(evaluator_id)
+        for evaluator_id, name in raw.items()
+        if evaluator_id and name
+    }
+
+
+def build_evaluator_runs_for_eval_job(
+    metrics: Any,
+    evaluator_id_by_metric_key: Optional[Dict[str, str]] = None,
+) -> List[EvaluatorRunEntry]:
+    """Pair evaluator aggregates with UUIDs from calibrate's config map."""
+    metrics_dict = normalize_metrics(metrics)
+    if not isinstance(metrics_dict, dict):
+        return []
+    keys = ordered_evaluator_metric_keys(metrics_dict)
+    if not keys:
+        return []
+    evaluator_id_by_metric_key = evaluator_id_by_metric_key or {}
+    runs: List[EvaluatorRunEntry] = []
+    for mk in keys:
+        eu = evaluator_id_by_metric_key.get(mk)
+        if not eu:
+            continue
+        agg = metrics_dict.get(mk)
+        if agg is None:
+            continue
+        runs.append(
+            EvaluatorRunEntry(
+                evaluator_uuid=eu,
+                metric_key=mk,
+                aggregate=dict(agg) if isinstance(agg, dict) else {"value": agg},
+            )
+        )
+    return runs
+
+
+def enrich_evaluator_runs_with_current_names(
+    provider_results: Optional[List[Any]],
+    evaluator_snapshots: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Mutates each provider result dict in place and refreshes evaluator run metadata."""
+    if not provider_results:
+        return
+    from db import get_evaluator
+
+    snapshot_by_uuid = {
+        s["uuid"]: s
+        for s in (evaluator_snapshots or [])
+        if isinstance(s, dict) and s.get("uuid")
+    }
+
+    for pr in provider_results:
+        runs_raw = pr.get("evaluator_runs")
+        if not runs_raw:
+            continue
+        for run in runs_raw:
+            if not isinstance(run, dict):
+                continue
+            uid = run.get("evaluator_uuid")
+            row = get_evaluator(uid) if uid else None
+            snapshot = snapshot_by_uuid.get(uid) if uid else None
+            run["name"] = (
+                (row.get("name") if row else None)
+                or (snapshot.get("name") if snapshot else None)
+                or run.get("metric_key")
+                or ""
+            )
+            run["description"] = row.get("description") if row else None
+
+
 def read_leaderboard_xlsx(leaderboard_dir: Path) -> Optional[List[dict]]:
     """Read the leaderboard summary from the xlsx file in leaderboard directory.
 
@@ -780,7 +927,9 @@ def read_leaderboard_xlsx(leaderboard_dir: Path) -> Optional[List[dict]]:
 
     xlsx_files = list(leaderboard_dir.glob("*.xlsx"))
     if not xlsx_files:
-        logger.warning(f"No xlsx files found in leaderboard directory: {leaderboard_dir}")
+        logger.warning(
+            f"No xlsx files found in leaderboard directory: {leaderboard_dir}"
+        )
         all_files = list(leaderboard_dir.iterdir())
         logger.info(f"Files in leaderboard directory: {[f.name for f in all_files]}")
         return None
@@ -793,7 +942,9 @@ def read_leaderboard_xlsx(leaderboard_dir: Path) -> Optional[List[dict]]:
         logger.info(f"Workbook sheets: {wb.sheetnames}")
 
         if "summary" not in wb.sheetnames:
-            logger.warning(f"'summary' sheet not found in {xlsx_file.name}, sheets: {wb.sheetnames}")
+            logger.warning(
+                f"'summary' sheet not found in {xlsx_file.name}, sheets: {wb.sheetnames}"
+            )
             return None
 
         ws = wb["summary"]

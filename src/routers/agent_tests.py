@@ -1,3 +1,4 @@
+import copy
 import csv
 import os
 import json
@@ -25,6 +26,9 @@ from db import (
     get_agent,
     get_test,
     get_tools_for_agent,
+    get_evaluators_for_test,
+    get_evaluator_by_slug,
+    get_evaluator_version,
     create_agent_test_job,
     get_agent_test_job,
     update_agent_test_job,
@@ -33,6 +37,7 @@ from db import (
     get_agent_test_jobs_for_user,
     delete_agent_test_job,
 )
+from llm_judge import build_test_evaluators_payload
 from auth_utils import get_current_user_id
 from utils import (
     TaskStatus,
@@ -45,6 +50,7 @@ from utils import (
     is_job_timed_out,
     capture_exception_to_sentry,
     build_tool_configs,
+    upload_directory_tree_to_s3,
     upload_file_to_s3,
 )
 
@@ -184,14 +190,48 @@ class TestOutput(BaseModel):
     tool_calls: Optional[List[ToolCallOutput]] = None
 
 
+class JudgeResult(BaseModel):
+    """One evaluator's verdict for a response-type test case.
+
+    `name` is the **current** evaluator name from the DB (refreshed at every read).
+    `description` is the current evaluator description from the DB (refreshed at every read).
+    `evaluator_uuid` is None for legacy runs that pre-date the evaluator-snapshot
+    capture or when the evaluator can't be resolved from the snapshot.
+    Exactly one of `match` (binary) / `score` (rating) is set per entry; both are
+    None for tool-call tests, but tool-call tests don't carry `judge_results`.
+
+    `variable_values` are the {{var}} substitutions used for this evaluator on
+    this test case, frozen from `test_evaluators.variable_values` at submission
+    time. `scale_min` / `scale_max` are present only for rating evaluators and
+    come from the pinned version's `output_config.scale`, so the score is always
+    framed against the rubric the run actually used.
+    """
+
+    evaluator_uuid: Optional[str] = None
+    name: str
+    description: Optional[str] = None
+    reasoning: Optional[str] = None
+    match: Optional[bool] = None
+    score: Optional[float] = None
+    variable_values: Optional[Dict[str, Any]] = None
+    scale_min: Optional[float] = None
+    scale_max: Optional[float] = None
+
+
 class TestCaseResult(BaseModel):
     """Result for a single test case matching calibrate results.json structure"""
 
+    test_case_id: Optional[str] = None
     name: Optional[str] = None  # Test name, present during in-progress and done states
     passed: Optional[bool] = None  # Only present when done
-    reasoning: Optional[str] = None  # LLM judge reasoning or deterministic diff; null for passing tool call tests
+    reasoning: Optional[str] = (
+        None  # LLM judge reasoning or deterministic diff; null for passing tool call tests
+    )
     output: Optional[TestOutput] = None  # Only present when done
     test_case: Optional[Dict[str, Any]] = None  # Only present when done
+    # Per-evaluator verdicts for response-type tests; None for tool-call tests or
+    # in-progress rows. Names reflect the current DB value (refreshed on each read).
+    judge_results: Optional[List[JudgeResult]] = None
 
 
 class TestRunStatusResponse(BaseModel):
@@ -234,6 +274,7 @@ class AgentTestRunsResponse(BaseModel):
 
 class GlobalTestRunListItem(AgentTestRunListItem):
     """AgentTestRunListItem extended with agent identity for the global view."""
+
     agent_id: str
     agent_name: str
 
@@ -329,6 +370,24 @@ async def get_agent_test_runs(agent_uuid: str):
 
         # Extract results from job
         job_results = job.get("results") or {}
+        job_details = job.get("details") or {}
+        evaluators_snapshot = (
+            job_details.get("evaluators_by_test_id")
+            or {}
+        )
+
+        # Refresh evaluator names + uuids on per-row judge_results before serializing
+        _evaluator_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        _enrich_test_results_with_evaluators(
+            job_results.get("test_results"),
+            evaluators_snapshot,
+            _evaluator_cache,
+        )
+        _enrich_model_results_with_evaluators(
+            job_results.get("model_results"),
+            evaluators_snapshot,
+            _evaluator_cache,
+        )
 
         run_item = AgentTestRunListItem(
             uuid=job["uuid"],
@@ -387,7 +446,9 @@ async def get_all_test_runs_for_user(
             agent_unit_counts[agent_id] = agent_unit_counts.get(agent_id, 0) + 1
             name_map[job["uuid"]] = f"Run {agent_unit_counts[agent_id]}"
         elif job_type == "llm-benchmark":
-            agent_benchmark_counts[agent_id] = agent_benchmark_counts.get(agent_id, 0) + 1
+            agent_benchmark_counts[agent_id] = (
+                agent_benchmark_counts.get(agent_id, 0) + 1
+            )
             name_map[job["uuid"]] = f"Benchmark {agent_benchmark_counts[agent_id]}"
         else:
             name_map[job["uuid"]] = "Job"
@@ -395,6 +456,25 @@ async def get_all_test_runs_for_user(
     runs = []
     for job in jobs:  # already newest-first
         job_results = job.get("results") or {}
+        job_details = job.get("details") or {}
+        evaluators_snapshot = (
+            job_details.get("evaluators_by_test_id")
+            or {}
+        )
+
+        # Refresh evaluator names + uuids on per-row judge_results before serializing
+        _evaluator_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        _enrich_test_results_with_evaluators(
+            job_results.get("test_results"),
+            evaluators_snapshot,
+            _evaluator_cache,
+        )
+        _enrich_model_results_with_evaluators(
+            job_results.get("model_results"),
+            evaluators_snapshot,
+            _evaluator_cache,
+        )
+
         run_item = GlobalTestRunListItem(
             uuid=job["uuid"],
             name=name_map[job["uuid"]],
@@ -477,7 +557,7 @@ def _build_calibrate_config(
     agent: Dict[str, Any],
     tests: List[Dict[str, Any]],
     model: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
     """
     Build the calibrate test config from agent and tests.
 
@@ -485,10 +565,140 @@ def _build_calibrate_config(
         agent: Agent dict with config
         tests: List of test dicts with config
         model: Optional model override. If None, uses agent's llm.model or defaults to gpt-4.1
+
+    Returns:
+        Tuple of (config, evaluators_by_test_id).
+
+        ``evaluators_by_test_id`` maps test UUID → ordered list of evaluator
+        snapshot dicts for response-type tests. Each entry has:
+          - ``uuid`` / ``name`` — evaluator UUID and the calibrate-rendered name
+            (the key calibrate uses inside ``metrics.judge_results``), used to
+            map results back to the evaluator at read time.
+          - ``output_type`` — ``"binary"`` or ``"rating"``.
+          - ``variable_values`` — the per-test ``{{var}}`` substitutions sent to
+            calibrate (frozen at submission time, so the value reflects what the
+            run actually used even if the link is later edited).
+          - ``scale_min`` / ``scale_max`` — present only for ``rating``, derived
+            from the pinned evaluator-version ``output_config.scale``.
+
+        Tests without linked evaluators (e.g. tool_call tests) are absent from
+        this dict.
     """
     agent_config = agent.get("config") or {}
 
-    # Combine test cases from all tests (same for both modes)
+    # First pass: collect linked evaluators per response-type test so we can build a
+    # deduped top-level `evaluators` list. Calibrate keys results by evaluator
+    # name across the whole run, so each unique evaluator appears once at top level and
+    # each test case references it by name (with optional `arguments` for {{var}} subs).
+    #
+    # Legacy back-compat: a response-type test created with `evaluation.criteria` as a
+    # plain string (no `test_evaluators` link) is auto-promoted to a synthesized link
+    # against the seeded `default-llm-next-reply` evaluator with
+    # `variable_values={"criteria": <string>}`. That way the calibrate handoff always
+    # uses our canonical evaluator (with our exact prompt) rather than relying on
+    # calibrate's built-in `criteria-passed` fallback.
+    default_llm_link_template: Optional[Dict[str, Any]] = None
+
+    def _synthetic_default_llm_link(criteria_text: str) -> Optional[Dict[str, Any]]:
+        nonlocal default_llm_link_template
+        if default_llm_link_template is None:
+            default_evaluator = get_evaluator_by_slug("default-llm-next-reply")
+            if not default_evaluator or not default_evaluator.get("live_version_id"):
+                logger.warning(
+                    "default-llm-next-reply evaluator missing or has no live version; "
+                    "legacy string criteria will be skipped"
+                )
+                return None
+            version = get_evaluator_version(default_evaluator["live_version_id"])
+            if not version:
+                return None
+            default_llm_link_template = {
+                **default_evaluator,
+                "evaluator_version_id": version["uuid"],
+                "judge_model": version["judge_model"],
+                "system_prompt": version["system_prompt"],
+                "output_config": version.get("output_config"),
+                "variables": version.get("variables"),
+            }
+        return {
+            **default_llm_link_template,
+            "variable_values": {"criteria": criteria_text},
+        }
+
+    tests_with_evaluators: List[Dict[str, Any]] = []
+    for test in tests:
+        test_config = test.get("config")
+        if not test_config:
+            continue
+        evaluation = test_config.get("evaluation", {})
+        if evaluation.get("type") != "response":
+            continue
+
+        linked_evaluators = get_evaluators_for_test(test["uuid"])
+
+        if not linked_evaluators:
+            legacy_criteria = evaluation.get("criteria")
+            if isinstance(legacy_criteria, str) and legacy_criteria.strip():
+                synth = _synthetic_default_llm_link(legacy_criteria)
+                if synth is not None:
+                    linked_evaluators = [synth]
+
+        tests_with_evaluators.append(
+            {"test_uuid": test["uuid"], "evaluators": linked_evaluators}
+        )
+
+    top_level_evaluators, criteria_per_test = build_test_evaluators_payload(
+        tests_with_evaluators
+    )
+
+    # Snapshot mapping test UUID → ordered list of evaluator snapshot dicts for
+    # response-type evaluators. Each entry carries enough info to reconstruct
+    # the API response at read time without re-reading the (possibly edited
+    # since) evaluator-version row:
+    #   - {uuid, name}: lookup keys (descriptions are read live from the DB)
+    #   - output_type: distinguishes binary vs rating in JudgeResult
+    #   - variable_values: {{var}} substitutions sent to calibrate (frozen)
+    #   - scale_min / scale_max: rating bounds from the pinned version's
+    #     output_config.scale; omitted for binary
+    evaluators_by_test_id: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in tests_with_evaluators:
+        test_uuid = entry["test_uuid"]
+        refs = criteria_per_test.get(test_uuid) or []
+        evals = entry.get("evaluators") or []
+        pairs: List[Dict[str, Any]] = []
+        for i, ev in enumerate(evals):
+            ev_uuid = ev.get("uuid")
+            if not ev_uuid or i >= len(refs):
+                continue
+            output_type = ev.get("output_type") or "binary"
+            snap_entry: Dict[str, Any] = {
+                "uuid": ev_uuid,
+                "name": refs[i].get("name", ""),
+                "output_type": output_type,
+                "variable_values": ev.get("variable_values") or {},
+            }
+            if output_type == "rating":
+                output_config = ev.get("output_config")
+                if isinstance(output_config, dict):
+                    scale = output_config.get("scale")
+                    if isinstance(scale, list) and scale:
+                        # Reject bool because bool is a subclass of int; rating
+                        # scales must be numeric (int/float), not True/False.
+                        numeric_values = [
+                            e.get("value")
+                            for e in scale
+                            if isinstance(e, dict)
+                            and isinstance(e.get("value"), (int, float))
+                            and not isinstance(e.get("value"), bool)
+                        ]
+                        if numeric_values:
+                            snap_entry["scale_min"] = min(numeric_values)
+                            snap_entry["scale_max"] = max(numeric_values)
+            pairs.append(snap_entry)
+        if pairs:
+            evaluators_by_test_id[test_uuid] = pairs
+
+    # Second pass: shape each test case with its evaluation.criteria refs.
     all_test_cases = []
     for test in tests:
         test_name = test.get("name")
@@ -497,10 +707,12 @@ def _build_calibrate_config(
             continue
 
         test_config["name"] = test_name
+        test_config["id"] = test["uuid"]
+        evaluation = test_config.get("evaluation", {})
 
-        if test_config["evaluation"]["type"] == "tool_call":
+        if evaluation.get("type") == "tool_call":
             tool_calls = []
-            for tool_call in test_config["evaluation"]["tool_calls"]:
+            for tool_call in evaluation.get("tool_calls", []):
                 tool_calls.append(
                     {
                         "tool": tool_call["tool"],
@@ -511,7 +723,11 @@ def _build_calibrate_config(
                         ),
                     }
                 )
-            test_config["evaluation"]["tool_calls"] = tool_calls
+            evaluation["tool_calls"] = tool_calls
+        elif evaluation.get("type") == "response":
+            # Legacy string criteria are promoted to a synthetic evaluator link in the
+            # first pass; overwrite with structured refs from criteria_per_test.
+            evaluation["criteria"] = criteria_per_test.get(test["uuid"], [])
 
         all_test_cases.append(test_config)
 
@@ -521,9 +737,11 @@ def _build_calibrate_config(
             "agent_url": agent_config["agent_url"],
             "test_cases": all_test_cases,
         }
+        if top_level_evaluators:
+            config["evaluators"] = top_level_evaluators
         if agent_config.get("agent_headers"):
             config["agent_headers"] = agent_config["agent_headers"]
-        return config
+        return config, evaluators_by_test_id
 
     # Calibrate agent mode
     if model is None:
@@ -533,12 +751,30 @@ def _build_calibrate_config(
     agent_tools = get_tools_for_agent(agent["uuid"])
     tool_configs = build_tool_configs(agent_tools)
 
-    return {
+    config = {
         "params": {"model": model},
         "system_prompt": agent_config.get("system_prompt", ""),
         "tools": tool_configs,
         "test_cases": all_test_cases,
     }
+    if top_level_evaluators:
+        config["evaluators"] = top_level_evaluators
+    return config, evaluators_by_test_id
+
+
+def _calibrate_config_from_agent_test_job(
+    task_id: str,
+    agent: Dict[str, Any],
+    tests: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Load the calibrate JSON config frozen at job creation, or rebuild for legacy jobs."""
+    job = get_agent_test_job(task_id)
+    details = (job or {}).get("details") or {}
+    stored = details.get("calibrate_config")
+    if isinstance(stored, dict) and stored:
+        return copy.deepcopy(stored)
+    calibrate_config, _ = _build_calibrate_config(agent, tests)
+    return calibrate_config
 
 
 def _read_agent_test_results_json(output_dir: Path) -> Optional[List[dict]]:
@@ -574,7 +810,14 @@ def _read_agent_test_metrics_json(output_dir: Path) -> Optional[dict]:
 
 
 def _parse_agent_test_results(results_data: Optional[List[dict]]) -> List[dict]:
-    """Parse results.json data into the format expected by the API."""
+    """Parse results.json data into the format expected by the API.
+
+    `judge_results` is preserved as the raw calibrate-emitted dict
+    (``{<calibrate_name>: {reasoning, match|score}}``) for response-type tests; it
+    is later converted to a structured list (with evaluator UUIDs and current DB
+    names) by ``_enrich_test_results_with_evaluators`` at API read time.
+    Tool-call tests have no ``judge_results`` from calibrate, so the field is None.
+    """
     if not results_data or not isinstance(results_data, list):
         return []
     test_results = []
@@ -585,6 +828,7 @@ def _parse_agent_test_results(results_data: Optional[List[dict]]) -> List[dict]:
         test_results.append(
             {
                 "name": test_case.get("name"),
+                "test_case_id": r.get("test_case_id") or test_case.get("id"),
                 "passed": metrics.get("passed", False),
                 "reasoning": metrics.get("reasoning"),
                 "output": {
@@ -592,9 +836,255 @@ def _parse_agent_test_results(results_data: Optional[List[dict]]) -> List[dict]:
                     "tool_calls": output_data.get("tool_calls"),
                 },
                 "test_case": test_case,
+                "judge_results": metrics.get("judge_results"),
             }
         )
     return test_results
+
+
+def _pending_test_case_result_placeholder(name: str) -> Dict[str, Any]:
+    """``TestCaseResult`` shape for rows not yet finished (explicit nulls for clients)."""
+    return {
+        "test_case_id": None,
+        "name": name,
+        "passed": None,
+        "reasoning": None,
+        "output": None,
+        "test_case": None,
+        "judge_results": None,
+    }
+
+
+def _merge_test_results_by_test_names(
+    test_names: List[str], parsed: List[dict]
+) -> List[dict]:
+    """Interleave calibrate rows with pending placeholders in suite order (same
+    fields as :func:`_pending_test_case_result_placeholder`). Used for unit-test
+    and per-model benchmark rows."""
+    if not test_names:
+        return []
+    completed = {r.get("name"): r for r in parsed if r.get("name")}
+    out: List[dict] = []
+    for name in test_names:
+        if name in completed:
+            out.append(completed[name])
+        else:
+            out.append(_pending_test_case_result_placeholder(name))
+    return out
+
+
+def _benchmark_queued_model_results(
+    models: List[str], test_names: List[str]
+) -> List[Dict[str, Any]]:
+    """Per-model result shell with placeholder ``test_results`` (queued / not started)."""
+    placeholders = [_pending_test_case_result_placeholder(n) for n in test_names]
+    return [
+        {
+            "model": model,
+            "success": None,
+            "message": "Queued...",
+            "total_tests": None,
+            "passed": None,
+            "failed": None,
+            "evaluator_summary": None,
+            "test_results": placeholders,
+        }
+        for model in models
+    ]
+
+
+def _get_evaluator_cached_for_enrichment(
+    uid: str, cache: Dict[str, Optional[Dict[str, Any]]]
+) -> Optional[Dict[str, Any]]:
+    """Single SQLite round-trip per UUID per enrichment pass (see simulations
+    ``current_by_uuid`` in ``apply_simulation_job_evaluator_enrichment``)."""
+    if uid not in cache:
+        from db import get_evaluator
+
+        cache[uid] = get_evaluator(uid)
+    return cache[uid]
+
+
+def _enrich_test_results_with_evaluators(
+    test_results: Optional[List[Dict[str, Any]]],
+    evaluators_by_test_id: Optional[Dict[str, List[Dict[str, Any]]]],
+    evaluator_cache: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+) -> None:
+    """Mutate ``test_results`` in place: convert each row's raw ``judge_results``
+    dict (keyed by calibrate evaluator name) into a structured list of
+    ``{evaluator_uuid, name, description, reasoning, match, score,
+    variable_values, scale_min, scale_max}`` entries.
+
+    ``name`` and ``description`` reflect the **current** evaluator row from the DB (latest).
+    ``variable_values`` and the rating ``scale_min``/``scale_max`` come from
+    the snapshot frozen at submission time, so they always match what the run
+    actually used.
+
+    Idempotent: if ``judge_results`` is already a list (e.g. re-enriched), the
+    ``name`` and ``description`` fields are refreshed against the current DB row.
+
+    Pass ``evaluator_cache`` to dedupe ``get_evaluator`` across rows and across
+    nested benchmark models (same dict as ``_enrich_model_results_with_evaluators``).
+    """
+    if not test_results:
+        return
+
+    cache: Dict[str, Optional[Dict[str, Any]]] = (
+        evaluator_cache if evaluator_cache is not None else {}
+    )
+    snapshot_map = evaluators_by_test_id or {}
+    for r in test_results:
+        if not isinstance(r, dict):
+            continue
+        raw = r.get("judge_results")
+        if raw is None:
+            continue
+
+        if isinstance(raw, list):
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                uid = entry.get("evaluator_uuid")
+                if not uid:
+                    continue
+                ev = _get_evaluator_cached_for_enrichment(uid, cache)
+                if ev and ev.get("name"):
+                    entry["name"] = ev["name"]
+                entry["description"] = ev.get("description") if ev else None
+            continue
+
+        if not isinstance(raw, dict):
+            continue
+
+        test_id = r.get("test_case_id")
+        snapshot = snapshot_map.get(test_id) if test_id else None
+        uuid_to_meta: Dict[str, Dict[str, Any]] = {}
+        if isinstance(snapshot, list):
+            for e in snapshot:
+                if isinstance(e, dict) and e.get("uuid"):
+                    uuid_to_meta[e["uuid"]] = e
+
+        out: List[Dict[str, Any]] = []
+        for cal_name, entry in raw.items():
+            if not isinstance(entry, dict):
+                continue
+            echoed_uid = entry.get("evaluator_id")
+            meta = (uuid_to_meta.get(echoed_uid) if echoed_uid else None) or {}
+            uid = echoed_uid
+            current_name: Optional[str] = None
+            current_description: Optional[str] = None
+            if uid:
+                ev = _get_evaluator_cached_for_enrichment(uid, cache)
+                if ev:
+                    current_name = ev.get("name")
+                    current_description = ev.get("description")
+            out.append(
+                {
+                    "evaluator_uuid": uid,
+                    "name": current_name or cal_name,
+                    "description": current_description,
+                    "reasoning": entry.get("reasoning"),
+                    "match": entry.get("match"),
+                    "score": entry.get("score"),
+                    "variable_values": meta.get("variable_values") or None,
+                    "scale_min": meta.get("scale_min"),
+                    "scale_max": meta.get("scale_max"),
+                }
+            )
+        r["judge_results"] = out
+
+
+def _enrich_model_results_with_evaluators(
+    model_results: Optional[List[Dict[str, Any]]],
+    evaluators_by_test_id: Optional[Dict[str, List[Dict[str, Any]]]],
+    evaluator_cache: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+) -> None:
+    """Run ``_enrich_test_results_with_evaluators`` for each model's nested
+    ``test_results`` list. The same snapshot applies to every model in a
+    benchmark run because all models execute the same test suite."""
+    if not model_results:
+        return
+    cache: Dict[str, Optional[Dict[str, Any]]] = (
+        evaluator_cache if evaluator_cache is not None else {}
+    )
+    for mr in model_results:
+        if isinstance(mr, dict):
+            _enrich_test_results_with_evaluators(
+                mr.get("test_results"), evaluators_by_test_id, cache
+            )
+            _enrich_evaluator_summary(mr.get("evaluator_summary"), cache)
+
+
+def _build_evaluator_summary(metrics_data: Optional[dict]) -> Optional[List[Dict[str, Any]]]:
+    """Extract per-evaluator benchmark aggregates from calibrate metrics.json."""
+    if not isinstance(metrics_data, dict):
+        return None
+    criteria = metrics_data.get("criteria")
+    if not isinstance(criteria, dict):
+        return None
+
+    summary: List[Dict[str, Any]] = []
+    for metric_key, aggregate in criteria.items():
+        if not isinstance(aggregate, dict):
+            continue
+        evaluator_type = aggregate.get("type")
+        if evaluator_type not in {"binary", "rating"}:
+            continue
+
+        entry: Dict[str, Any] = {
+            "metric_key": metric_key,
+            "name": metric_key,
+            "type": evaluator_type,
+            "evaluator_uuid": aggregate.get("evaluator_id"),
+        }
+
+        if evaluator_type == "binary":
+            entry.update(
+                {
+                    "passed": aggregate.get("passed"),
+                    "total": aggregate.get("total"),
+                    "pass_rate": aggregate.get("pass_rate"),
+                }
+            )
+        else:
+            entry.update(
+                {
+                    "mean": aggregate.get("mean"),
+                    "min": aggregate.get("min"),
+                    "max": aggregate.get("max"),
+                    "count": aggregate.get("count"),
+                    "scale_min": aggregate.get("scale_min"),
+                    "scale_max": aggregate.get("scale_max"),
+                }
+            )
+
+        summary.append(entry)
+
+    return summary or None
+
+
+def _enrich_evaluator_summary(
+    evaluator_summary: Optional[List[Dict[str, Any]]],
+    evaluator_cache: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+) -> None:
+    """Refresh evaluator names/descriptions in per-model aggregate summaries."""
+    if not evaluator_summary:
+        return
+
+    cache: Dict[str, Optional[Dict[str, Any]]] = (
+        evaluator_cache if evaluator_cache is not None else {}
+    )
+    for entry in evaluator_summary:
+        if not isinstance(entry, dict):
+            continue
+        uid = entry.get("evaluator_uuid")
+        if not uid:
+            entry.setdefault("description", None)
+            continue
+        ev = _get_evaluator_cached_for_enrichment(uid, cache)
+        if ev and ev.get("name"):
+            entry["name"] = ev["name"]
+        entry["description"] = ev.get("description") if ev else None
 
 
 def _find_all_results_in_output(output_dir: Path) -> Dict[str, tuple]:
@@ -702,16 +1192,8 @@ def _update_agent_test_intermediate_results(
     test_results = _parse_agent_test_results(results_data)
     completed_count = len(test_results)
 
-    # Create a dict of completed tests by name
-    completed_tests = {r.get("name"): r for r in test_results if r.get("name")}
-
     # Build intermediate results: show completed tests with results, pending tests with just name
-    intermediate_results = []
-    for name in test_names:
-        if name in completed_tests:
-            intermediate_results.append(completed_tests[name])
-        else:
-            intermediate_results.append({"name": name})
+    intermediate_results = _merge_test_results_by_test_names(test_names, test_results)
 
     # Check if metrics.json exists (all tests complete)
     metrics_data = _read_agent_test_metrics_json(output_dir)
@@ -753,7 +1235,11 @@ def run_llm_test_task(
         update_agent_test_job(
             task_id,
             status=TaskStatus.IN_PROGRESS.value,
-            results={"test_results": [{"name": name} for name in test_names]},
+            results={
+                "test_results": [
+                    _pending_test_case_result_placeholder(name) for name in test_names
+                ]
+            },
         )
 
         s3 = get_s3_client()
@@ -762,8 +1248,9 @@ def run_llm_test_task(
             temp_path = Path(temp_dir)
 
             try:
-                # Build calibrate config
-                calibrate_config = _build_calibrate_config(agent, tests)
+                calibrate_config = _calibrate_config_from_agent_test_job(
+                    task_id, agent, tests
+                )
                 agent_config = agent.get("config") or {}
 
                 # Create directories
@@ -887,14 +1374,10 @@ def run_llm_test_task(
                                 metrics_data = json.load(f)
 
                 if results_data is None and metrics_data is None:
-                    error_msg = (
-                        f"LLM test produced no output files (results.json/metrics.json not found in {output_dir})"
-                    )
+                    error_msg = f"LLM test produced no output files (results.json/metrics.json not found in {output_dir})"
                     logger.error(error_msg)
                     capture_exception_to_sentry(RuntimeError(error_msg))
-                    raise subprocess.CalledProcessError(
-                        0, run_cmd, stdout, stderr
-                    )
+                    raise subprocess.CalledProcessError(0, run_cmd, stdout, stderr)
 
                 # Parse results
                 test_results = _parse_agent_test_results(results_data)
@@ -924,14 +1407,9 @@ def run_llm_test_task(
                     )
                     failed = total_tests - passed
 
-                # Upload results to S3
+                # Upload results to S3 (calibrate ``logs``/``results.log`` per model, run-level ``logs``, etc.)
                 results_prefix = f"agent-tests/runs/{task_id}"
-                for root, dirs, files in os.walk(output_dir):
-                    for file in files:
-                        local_file_path = Path(root) / file
-                        relative_path = local_file_path.relative_to(output_dir)
-                        s3_key = f"{results_prefix}/{relative_path}"
-                        upload_file_to_s3(s3, local_file_path, s3_bucket, s3_key)
+                upload_directory_tree_to_s3(s3, output_dir, s3_bucket, results_prefix)
 
                 # Upload the config file to S3
                 config_s3_key = f"{results_prefix}/test_config.json"
@@ -967,6 +1445,19 @@ def run_llm_test_task(
                 existing_results["error"] = (
                     f"LLM test failed: {e.stderr if hasattr(e, 'stderr') else str(e)}"
                 )
+                try:
+                    if output_dir.exists():
+                        upload_directory_tree_to_s3(
+                            s3,
+                            output_dir,
+                            s3_bucket,
+                            f"agent-tests/runs/{task_id}",
+                        )
+                        existing_results["results_s3_prefix"] = (
+                            f"agent-tests/runs/{task_id}"
+                        )
+                except Exception:
+                    pass
                 update_agent_test_job(
                     task_id,
                     status=TaskStatus.FAILED.value,
@@ -983,6 +1474,19 @@ def run_llm_test_task(
                 existing_results["error"] = (
                     f"Unexpected error during LLM test: {str(e)}"
                 )
+                try:
+                    if output_dir.exists():
+                        upload_directory_tree_to_s3(
+                            s3,
+                            output_dir,
+                            s3_bucket,
+                            f"agent-tests/runs/{task_id}",
+                        )
+                        existing_results["results_s3_prefix"] = (
+                            f"agent-tests/runs/{task_id}"
+                        )
+                except Exception:
+                    pass
                 update_agent_test_job(
                     task_id,
                     status=TaskStatus.FAILED.value,
@@ -1035,7 +1539,9 @@ async def run_agent_test(agent_uuid: str, request: RunTestRequest):
         for test_uuid in request.test_uuids:
             test = get_test(test_uuid)
             if not test:
-                raise HTTPException(status_code=404, detail=f"Test {test_uuid} not found")
+                raise HTTPException(
+                    status_code=404, detail=f"Test {test_uuid} not found"
+                )
             tests.append(test)
     else:
         # No test_uuids provided — run all tests linked to the agent
@@ -1064,6 +1570,10 @@ async def run_agent_test(agent_uuid: str, request: RunTestRequest):
     # Extract test names for progress tracking
     test_names = [test.get("name") for test in tests if test.get("name")]
 
+    # Snapshot calibrate config and per-test evaluator metadata at submission so the
+    # worker (and enrichment) stay aligned even if links or live versions change later.
+    calibrate_config, evaluators_by_test_id = _build_calibrate_config(agent, tests)
+
     # Create job in database with details for recovery
     test_uuids = [t["uuid"] for t in tests]
     job_id = create_agent_test_job(
@@ -1075,8 +1585,14 @@ async def run_agent_test(agent_uuid: str, request: RunTestRequest):
             "test_uuids": test_uuids,
             "test_names": test_names,
             "s3_bucket": s3_bucket,
+            "calibrate_config": calibrate_config,
+            "evaluators_by_test_id": evaluators_by_test_id,
         },
-        results={"test_results": [{"name": name} for name in test_names]},
+        results={
+            "test_results": [
+                _pending_test_case_result_placeholder(name) for name in test_names
+            ]
+        },
     )
 
     if can_start:
@@ -1123,6 +1639,7 @@ async def update_test_run_visibility(
 
     if body.is_public:
         import uuid as _uuid
+
         share_token = job.get("share_token") or str(_uuid.uuid4())
     else:
         share_token = None
@@ -1144,6 +1661,7 @@ async def get_agent_test_run_status(task_id: str):
 
     status = job["status"]
     results = job.get("results") or {}
+    details = job.get("details") or {}
 
     # Check for timeout on in-progress jobs
     # if status == TaskStatus.IN_PROGRESS.value:
@@ -1162,6 +1680,12 @@ async def get_agent_test_run_status(task_id: str):
 
     #         # Try to start the next queued job
     #         try_start_queued_agent_test_job(AGENT_TEST_JOB_TYPES)
+
+    _enrich_test_results_with_evaluators(
+        results.get("test_results"),
+        details.get("evaluators_by_test_id")
+        or {},
+    )
 
     return TestRunStatusResponse(
         task_id=task_id,
@@ -1191,6 +1715,7 @@ class ModelResult(BaseModel):
     total_tests: Optional[int] = None
     passed: Optional[int] = None
     failed: Optional[int] = None
+    evaluator_summary: Optional[List[Dict[str, Any]]] = None
     test_results: Optional[List[Dict[str, Any]]] = None
 
 
@@ -1209,6 +1734,7 @@ def _update_benchmark_intermediate_results(
     task_id: str,
     output_dir: Path,
     models: List[str],
+    test_names: List[str],
     cli_models: Optional[List[str]] = None,
 ) -> int:
     """
@@ -1216,6 +1742,7 @@ def _update_benchmark_intermediate_results(
     Returns the number of models with completed results.
 
     models: display names (original from frontend, e.g. "openai/gpt-4.1")
+    test_names: ordered suite names; pending rows are ``{name: ...}`` only, like unit tests.
     cli_models: names passed to CLI (may be stripped, e.g. "gpt-4.1"); defaults to models
     """
     if cli_models is None:
@@ -1243,9 +1770,16 @@ def _update_benchmark_intermediate_results(
                     test_case = results_data[i].get("test_case", {})
                     r["name"] = test_case.get("name")
 
+            merged = (
+                _merge_test_results_by_test_names(test_names, test_results)
+                if test_names
+                else test_results
+            )
+
             if metrics_data:
                 total = metrics_data.get("total", 0)
                 passed = metrics_data.get("passed", 0)
+                evaluator_summary = _build_evaluator_summary(metrics_data)
                 model_results.append(
                     {
                         "model": model,
@@ -1254,14 +1788,15 @@ def _update_benchmark_intermediate_results(
                         "total_tests": total,
                         "passed": passed,
                         "failed": total - passed,
-                        "test_results": test_results,
+                        "evaluator_summary": evaluator_summary,
+                        "test_results": merged,
                     }
                 )
                 completed_count += 1
             elif test_results:
                 # Has partial results but no metrics yet
-                total = len(test_results)
-                passed = sum(1 for r in test_results if r.get("passed", False))
+                total = len(merged) if test_names else len(test_results)
+                passed = sum(1 for r in merged if r.get("passed", False))
                 model_results.append(
                     {
                         "model": model,
@@ -1270,7 +1805,8 @@ def _update_benchmark_intermediate_results(
                         "total_tests": total,
                         "passed": passed,
                         "failed": total - passed,
-                        "test_results": test_results,
+                        "evaluator_summary": None,
+                        "test_results": merged,
                     }
                 )
             else:
@@ -1283,7 +1819,12 @@ def _update_benchmark_intermediate_results(
                         "total_tests": None,
                         "passed": None,
                         "failed": None,
-                        "test_results": None,
+                        "evaluator_summary": None,
+                        "test_results": (
+                            _merge_test_results_by_test_names(test_names, [])
+                            if test_names
+                            else None
+                        ),
                     }
                 )
         else:
@@ -1296,7 +1837,12 @@ def _update_benchmark_intermediate_results(
                     "total_tests": None,
                     "passed": None,
                     "failed": None,
-                    "test_results": None,
+                    "evaluator_summary": None,
+                    "test_results": (
+                        _merge_test_results_by_test_names(test_names, [])
+                        if test_names
+                        else None
+                    ),
                 }
             )
 
@@ -1325,15 +1871,13 @@ def run_benchmark_task(
             f"with {len(tests)} test(s) and {len(models)} model(s)"
         )
 
-        # Initialize with pending model results
-        initial_model_results = [
-            {"model": model, "success": None, "message": "Queued..."}
-            for model in models
-        ]
+        test_names = [t.get("name") for t in tests if t.get("name")]
+
+        # Initialize with pending model results (per-model test list like unit tests)
         update_agent_test_job(
             task_id,
             status=TaskStatus.IN_PROGRESS.value,
-            results={"model_results": initial_model_results},
+            results={"model_results": _benchmark_queued_model_results(models, test_names)},
         )
 
         s3 = get_s3_client()
@@ -1342,8 +1886,9 @@ def run_benchmark_task(
             temp_path = Path(temp_dir)
 
             try:
-                # Build the calibrate config
-                calibrate_config = _build_calibrate_config(agent, tests)
+                calibrate_config = _calibrate_config_from_agent_test_job(
+                    task_id, agent, tests
+                )
                 agent_config = agent.get("config") or {}
 
                 # Clear any model from config — models are passed via CLI flags
@@ -1367,9 +1912,13 @@ def run_benchmark_task(
                     # Frontend always sends models in openrouter format (provider/model).
                     # Strip the provider prefix for non-openrouter providers so the
                     # agent receives just the model name (e.g. "gpt-4.1" not "openai/gpt-4.1").
-                    benchmark_provider = agent_config.get("benchmark_provider", "openrouter")
+                    benchmark_provider = agent_config.get(
+                        "benchmark_provider", "openrouter"
+                    )
                     if benchmark_provider != "openrouter":
-                        cli_models = [m.split("/", 1)[-1] if "/" in m else m for m in models]
+                        cli_models = [
+                            m.split("/", 1)[-1] if "/" in m else m for m in models
+                        ]
                     else:
                         cli_models = models
                     run_cmd = (
@@ -1411,7 +1960,7 @@ def run_benchmark_task(
                     prev_completed = 0
                     while process.poll() is None:
                         completed = _update_benchmark_intermediate_results(
-                            task_id, output_dir, models, cli_models
+                            task_id, output_dir, models, test_names, cli_models
                         )
                         if completed != prev_completed:
                             logger.info(
@@ -1421,7 +1970,9 @@ def run_benchmark_task(
                         time.sleep(2)  # Poll every 2 seconds
 
                     # Final update after process completes
-                    _update_benchmark_intermediate_results(task_id, output_dir, models, cli_models)
+                    _update_benchmark_intermediate_results(
+                        task_id, output_dir, models, test_names, cli_models
+                    )
 
                 # Read stdout/stderr
                 with open(stdout_path, "r") as f:
@@ -1453,14 +2004,10 @@ def run_benchmark_task(
                 all_results = _find_all_results_in_output(output_dir)
 
                 if not all_results:
-                    error_msg = (
-                        f"Benchmark produced no output files (no results.json/metrics.json found in {output_dir})"
-                    )
+                    error_msg = f"Benchmark produced no output files (no results.json/metrics.json found in {output_dir})"
                     logger.error(error_msg)
                     capture_exception_to_sentry(RuntimeError(error_msg))
-                    raise subprocess.CalledProcessError(
-                        0, run_cmd, stdout, stderr
-                    )
+                    raise subprocess.CalledProcessError(0, run_cmd, stdout, stderr)
                 folder_names = list(all_results.keys())
                 logger.info(f"Found result folders: {folder_names}")
 
@@ -1484,9 +2031,15 @@ def run_benchmark_task(
                                 test_case = results_data[i].get("test_case", {})
                                 r["name"] = test_case.get("name")
 
+                        if test_names:
+                            test_results = _merge_test_results_by_test_names(
+                                test_names, test_results
+                            )
+
                         if metrics_data:
                             total = metrics_data.get("total", 0)
                             passed = metrics_data.get("passed", 0)
+                            evaluator_summary = _build_evaluator_summary(metrics_data)
                             model_results.append(
                                 ModelResult(
                                     model=model,
@@ -1495,6 +2048,7 @@ def run_benchmark_task(
                                     total_tests=total,
                                     passed=passed,
                                     failed=total - passed,
+                                    evaluator_summary=evaluator_summary,
                                     test_results=test_results,
                                 )
                             )
@@ -1512,6 +2066,7 @@ def run_benchmark_task(
                                     total_tests=total,
                                     passed=passed,
                                     failed=total - passed,
+                                    evaluator_summary=None,
                                     test_results=test_results,
                                 )
                             )
@@ -1522,6 +2077,11 @@ def run_benchmark_task(
                                 model=model,
                                 success=False,
                                 message=f"No output found for model {model}",
+                                test_results=_merge_test_results_by_test_names(
+                                    test_names, []
+                                )
+                                if test_names
+                                else None,
                             )
                         )
 
@@ -1547,13 +2107,13 @@ def run_benchmark_task(
 
                 results_prefix = f"agent-tests/benchmarks/{task_id}"
 
-                # Upload output directory to S3
-                for root, dirs, files in os.walk(output_dir):
-                    for file in files:
-                        local_file_path = Path(root) / file
-                        relative_path = local_file_path.relative_to(output_dir)
-                        s3_key = f"{results_prefix}/outputs/{relative_path}"
-                        upload_file_to_s3(s3, local_file_path, s3_bucket, s3_key)
+                # Upload output directory to S3 (whole-run ``logs``, per-model logs/results.log, CSV/JSON, etc.)
+                upload_directory_tree_to_s3(
+                    s3,
+                    output_dir,
+                    s3_bucket,
+                    f"{results_prefix}/outputs",
+                )
 
                 logger.info(
                     f"Uploaded benchmark outputs to s3://{s3_bucket}/{results_prefix}/outputs/"
@@ -1600,12 +2160,22 @@ def run_benchmark_task(
             except subprocess.CalledProcessError as e:
                 traceback.print_exc()
                 capture_exception_to_sentry(e)
+                failed_results: Dict[str, Any] = {
+                    "error": f"Benchmark failed: {e.stderr if hasattr(e, 'stderr') else str(e)}",
+                }
+                try:
+                    if output_dir.exists():
+                        bp = f"agent-tests/benchmarks/{task_id}"
+                        upload_directory_tree_to_s3(
+                            s3, output_dir, s3_bucket, f"{bp}/outputs"
+                        )
+                        failed_results["results_s3_prefix"] = bp
+                except Exception:
+                    pass
                 update_agent_test_job(
                     task_id,
                     status=TaskStatus.FAILED.value,
-                    results={
-                        "error": f"Benchmark failed: {e.stderr if hasattr(e, 'stderr') else str(e)}",
-                    },
+                    results=failed_results,
                 )
             except Exception as e:
                 traceback.print_exc()
@@ -1618,6 +2188,15 @@ def run_benchmark_task(
                 existing_results["error"] = (
                     f"Unexpected error during benchmark: {str(e)}"
                 )
+                try:
+                    if output_dir.exists():
+                        bp = f"agent-tests/benchmarks/{task_id}"
+                        upload_directory_tree_to_s3(
+                            s3, output_dir, s3_bucket, f"{bp}/outputs"
+                        )
+                        existing_results["results_s3_prefix"] = bp
+                except Exception:
+                    pass
                 update_agent_test_job(
                     task_id,
                     status=TaskStatus.FAILED.value,
@@ -1704,6 +2283,8 @@ async def run_agent_benchmark(agent_uuid: str, request: BenchmarkRequest):
     # Extract test names for progress tracking
     test_names = [test.get("name") for test in tests if test.get("name")]
 
+    calibrate_config, evaluators_by_test_id = _build_calibrate_config(agent, tests)
+
     # Create job in database with details for recovery
     test_uuids = [t["uuid"] for t in tests]
     job_id = create_agent_test_job(
@@ -1716,8 +2297,14 @@ async def run_agent_benchmark(agent_uuid: str, request: BenchmarkRequest):
             "test_names": test_names,
             "models": request.models,
             "s3_bucket": s3_bucket,
+            "calibrate_config": calibrate_config,
+            "evaluators_by_test_id": evaluators_by_test_id,
         },
-        results={"test_results": [{"name": name} for name in test_names]},
+        results={
+            "model_results": _benchmark_queued_model_results(
+                request.models, test_names
+            )
+        },
     )
 
     if can_start:
@@ -1755,6 +2342,7 @@ async def update_benchmark_visibility(
 
     if body.is_public:
         import uuid as _uuid
+
         share_token = job.get("share_token") or str(_uuid.uuid4())
     else:
         share_token = None
@@ -1776,6 +2364,7 @@ async def get_benchmark_status(task_id: str):
 
     status = job["status"]
     results = job.get("results") or {}
+    details = job.get("details") or {}
 
     # Check for timeout on in-progress jobs
     # if status == TaskStatus.IN_PROGRESS.value:
@@ -1794,6 +2383,12 @@ async def get_benchmark_status(task_id: str):
 
     #         # Try to start the next queued job
     #         try_start_queued_agent_test_job(AGENT_TEST_JOB_TYPES)
+
+    _enrich_model_results_with_evaluators(
+        results.get("model_results"),
+        details.get("evaluators_by_test_id")
+        or {},
+    )
 
     return BenchmarkStatusResponse(
         task_id=task_id,

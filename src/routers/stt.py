@@ -11,16 +11,26 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
-from db import create_job, get_job, update_job, update_job_visibility
+from db import (
+    create_job,
+    get_job,
+    get_evaluator,
+    get_evaluator_version,
+    update_job,
+    update_job_visibility,
+)
 from dataset_utils import resolve_dataset_inputs
 from auth_utils import get_current_user_id
+from llm_judge import build_evaluator_cli_payload
 from utils import (
     TaskStatus,
     ProviderResult,
     TaskCreateResponse,
     TaskStatusResponse,
+    build_evaluator_runs_for_eval_job,
+    enrich_evaluator_runs_with_current_names,
     get_s3_client,
     get_s3_output_config,
     can_start_job,
@@ -31,12 +41,102 @@ from utils import (
     capture_exception_to_sentry,
     normalize_metrics,
     read_leaderboard_xlsx,
+    read_evaluators_map_from_config,
     presign_audio_path,
+    upload_directory_tree_to_s3,
     upload_file_to_s3,
+    upload_top_level_files_to_s3,
 )
 
 # Job types that share the same queue
 EVAL_JOB_TYPES = ["stt-eval", "tts-eval"]
+
+
+def _resolve_evaluators_for_job(
+    uuids: Optional[List[str]],
+    user_id: str,
+    default_slug: str,
+    expected_evaluator_type: str,
+) -> List[dict]:
+    """Resolve evaluator UUIDs into a list of fully-hydrated dicts ready to serialize
+    into the calibrate CLI config.
+
+    - Falls back to the default-slug evaluator when no UUIDs are provided.
+    - Pins each evaluator to its current live version at submission time.
+    - Enforces `evaluator.evaluator_type == expected_evaluator_type`. 400 on mismatch.
+    """
+    from db import get_evaluator_by_slug  # local import to avoid circular
+
+    resolved: List[dict] = []
+    effective_refs: List[dict] = [
+        {"evaluator_uuid": uid, "version_uuid": None, "variable_values": None}
+        for uid in (uuids or [])
+    ]
+
+    if not effective_refs:
+        default = get_evaluator_by_slug(default_slug)
+        if default and default.get("live_version_id"):
+            effective_refs = [
+                {
+                    "evaluator_uuid": default["uuid"],
+                    "version_uuid": default["live_version_id"],
+                    "variable_values": None,
+                }
+            ]
+
+    for ref in effective_refs:
+        evaluator = get_evaluator(ref["evaluator_uuid"])
+        if not evaluator:
+            raise HTTPException(
+                status_code=404, detail=f"Evaluator {ref['evaluator_uuid']} not found"
+            )
+        if (
+            evaluator.get("owner_user_id") is not None
+            and evaluator["owner_user_id"] != user_id
+        ):
+            raise HTTPException(
+                status_code=404, detail=f"Evaluator {ref['evaluator_uuid']} not found"
+            )
+        if evaluator.get("evaluator_type") != expected_evaluator_type:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Evaluator {ref['evaluator_uuid']} has evaluator_type="
+                    f"'{evaluator.get('evaluator_type')}' but this job requires "
+                    f"'{expected_evaluator_type}' evaluators."
+                ),
+            )
+        version_uuid = ref["version_uuid"] or evaluator.get("live_version_id")
+        if not version_uuid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Evaluator {ref['evaluator_uuid']} has no live version",
+            )
+        version = get_evaluator_version(version_uuid)
+        if not version or version["evaluator_id"] != evaluator["uuid"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Evaluator version {version_uuid} not found for evaluator {ref['evaluator_uuid']}",
+            )
+        resolved.append(
+            {
+                "uuid": evaluator["uuid"],
+                "name": evaluator["name"],
+                "evaluator_type": evaluator.get(
+                    "evaluator_type", expected_evaluator_type
+                ),
+                "data_type": evaluator.get("data_type", "text"),
+                "kind": evaluator.get("kind", "single"),
+                "output_type": evaluator.get("output_type", "binary"),
+                "evaluator_version_id": version["uuid"],
+                "judge_model": version["judge_model"],
+                "system_prompt": version["system_prompt"],
+                "output_config": version.get("output_config"),
+                "variables": version.get("variables"),
+                "variable_values": ref.get("variable_values") or {},
+            }
+        )
+    return resolved
 
 
 def _start_stt_job_from_queue(job: dict) -> bool:
@@ -80,11 +180,19 @@ def _collect_intermediate_results(output_dir: Path, providers: list) -> list:
 
     Returns a list of ProviderResult objects preserving any partial results.
     """
+    evaluator_id_by_metric_key = read_evaluators_map_from_config(output_dir)
     provider_results = []
     for provider in providers:
         provider_output_dir = _find_provider_output_dir(output_dir, provider)
         results_data = _read_results_csv(provider_output_dir)
         metrics_data = _read_metrics_json(provider_output_dir)
+        runs = (
+            build_evaluator_runs_for_eval_job(
+                metrics_data, evaluator_id_by_metric_key
+            )
+            if metrics_data is not None
+            else []
+        )
         if results_data:
             provider_results.append(
                 ProviderResult(
@@ -92,6 +200,7 @@ def _collect_intermediate_results(output_dir: Path, providers: list) -> list:
                     success=True,
                     metrics=metrics_data,
                     results=results_data,
+                    evaluator_runs=runs or None,
                 )
             )
         else:
@@ -105,6 +214,10 @@ def _collect_intermediate_results(output_dir: Path, providers: list) -> list:
 
 
 class STTEvaluationRequest(BaseModel):
+    # Reject unknown fields so legacy frontends sending the dropped `evaluators` shape get
+    # a loud 422 instead of silently running without their custom evaluators.
+    model_config = ConfigDict(extra="forbid")
+
     # Option 1: reuse an existing dataset
     dataset_id: Optional[str] = None
     # Option 2: inline upload (legacy / new files)
@@ -116,6 +229,11 @@ class STTEvaluationRequest(BaseModel):
         str
     ]  # List of STT providers (e.g., ["deepgram", "openai", "sarvam"])
     language: str  # Language (e.g., "english", "hindi")
+    # Optional list of evaluator UUIDs to score this run. If omitted, the seeded STT default
+    # evaluator is used. Each evaluator must have `evaluator_type == "stt"` (validated at
+    # submission time). At submission, each UUID is hydrated against the evaluator's then-live
+    # version and pinned into the job details so the run uses a stable rubric.
+    evaluator_uuids: Optional[List[str]] = None
 
 
 def _find_provider_output_dir(output_dir: Path, provider: str) -> Optional[Path]:
@@ -249,6 +367,18 @@ def run_evaluation_task(
                     ]
                 )
 
+                # Calibrate: --config <path> with {evaluators: [...]}
+                job_details = (get_job(task_id) or {}).get("details", {}) or {}
+                raw_evaluators = job_details.get("evaluators") or []
+                if raw_evaluators:
+                    evaluator_payload = build_evaluator_cli_payload(raw_evaluators)
+                    config_path = input_dir / "config.json"
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {"evaluators": evaluator_payload}, f, ensure_ascii=False
+                        )
+                    eval_cmd.extend(["--config", str(config_path)])
+
                 logger.info(f"Running STT eval command: {' '.join(eval_cmd)}")
 
                 # Create temp files for stdout/stderr
@@ -304,6 +434,7 @@ def run_evaluation_task(
 
                 # Read results for each provider
                 provider_results = []
+                evaluator_id_by_metric_key = read_evaluators_map_from_config(output_dir)
                 for provider in request.providers:
                     provider_output_dir = _find_provider_output_dir(
                         output_dir, provider
@@ -321,14 +452,25 @@ def run_evaluation_task(
                                     provider_output_dir
                                 )
                                 s3_key = f"{results_prefix}/{relative_path}"
-                                upload_file_to_s3(s3, local_file_path, s3_bucket, s3_key)
+                                upload_file_to_s3(
+                                    s3, local_file_path, s3_bucket, s3_key
+                                )
 
+                        eruns = (
+                            build_evaluator_runs_for_eval_job(
+                                metrics_data,
+                                evaluator_id_by_metric_key,
+                            )
+                            if metrics_data is not None
+                            else []
+                        )
                         provider_results.append(
                             ProviderResult(
                                 provider=provider,
                                 success=True,
                                 metrics=metrics_data,
                                 results=results_data,
+                                evaluator_runs=eruns or None,
                             )
                         )
                     else:
@@ -338,6 +480,14 @@ def run_evaluation_task(
                                 success=False,
                             )
                         )
+
+                # Run-level artifacts (whole-run ``logs``, ``leaderboard.csv``, backend stdout/stderr)
+                upload_top_level_files_to_s3(
+                    s3,
+                    output_dir,
+                    s3_bucket,
+                    f"stt/evals/{task_id}/outputs",
+                )
 
                 # Read leaderboard from output directory
                 leaderboard_dir = output_dir / "leaderboard"
@@ -365,15 +515,17 @@ def run_evaluation_task(
                         f"Leaderboard directory does not exist: {leaderboard_dir}"
                     )
 
-                # Create and upload config file to S3
-                config_data = {
-                    "providers": request.providers,
-                    "language": request.language,
-                    "audio_count": len(request.audio_paths),
-                }
-                config_file = temp_path / "config.json"
-                with open(config_file, "w", encoding="utf-8") as f:
-                    json.dump(config_data, f, indent=2)
+                # Prefer calibrate's run-root config.json because it contains evaluator IDs/maps.
+                config_file = output_dir / "config.json"
+                if not config_file.exists():
+                    config_data = {
+                        "providers": request.providers,
+                        "language": request.language,
+                        "audio_count": len(request.audio_paths),
+                    }
+                    config_file = temp_path / "config.json"
+                    with open(config_file, "w", encoding="utf-8") as f:
+                        json.dump(config_data, f, indent=2)
                 config_s3_key = f"stt/evals/{task_id}/config.json"
                 upload_file_to_s3(s3, config_file, s3_bucket, config_s3_key)
                 logger.info(f"Uploaded config file to S3: {config_s3_key}")
@@ -416,6 +568,13 @@ def run_evaluation_task(
                             error_results["provider_results"] = [
                                 r.model_dump() for r in intermediate
                             ]
+                        if output_dir.exists():
+                            upload_directory_tree_to_s3(
+                                s3,
+                                output_dir,
+                                s3_bucket,
+                                f"stt/evals/{task_id}/outputs",
+                            )
                 except Exception:
                     pass
                 update_job(
@@ -439,6 +598,13 @@ def run_evaluation_task(
                             error_results["provider_results"] = [
                                 r.model_dump() for r in intermediate
                             ]
+                        if output_dir.exists():
+                            upload_directory_tree_to_s3(
+                                s3,
+                                output_dir,
+                                s3_bucket,
+                                f"stt/evals/{task_id}/outputs",
+                            )
                 except Exception:
                     pass
                 update_job(
@@ -498,6 +664,13 @@ async def evaluate_stt(
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    resolved_evaluators = _resolve_evaluators_for_job(
+        uuids=request.evaluator_uuids,
+        user_id=user_id,
+        default_slug="default-stt-transcription",
+        expected_evaluator_type="stt",
+    )
+
     # Check if we can start immediately or need to queue
     can_start = can_start_job(EVAL_JOB_TYPES, user_id)
     initial_status = (
@@ -518,6 +691,7 @@ async def evaluate_stt(
             "dataset_id": resolved_dataset_id,
             "dataset_name": resolved_dataset_name,
             "dataset_item_ids": dataset_item_ids,
+            "evaluators": resolved_evaluators,
         },
         results=None,
     )
@@ -564,6 +738,7 @@ async def update_stt_visibility(
 
     if body.is_public:
         import uuid as _uuid
+
         share_token = job.get("share_token") or str(_uuid.uuid4())
     else:
         share_token = None
@@ -617,7 +792,8 @@ async def get_evaluation_status(
                     output_dir = Path(output_dir_str)
                     if output_dir.exists():
                         intermediate = _collect_intermediate_results(
-                            output_dir, requested_providers
+                            output_dir,
+                            requested_providers,
                         )
                         # Merge: keep existing successful results, add new ones from disk
                         merged_results = []
@@ -724,6 +900,10 @@ async def get_evaluation_status(
     for provider_result in provider_results:
         if provider_result.get("metrics"):
             provider_result["metrics"] = normalize_metrics(provider_result["metrics"])
+
+    enrich_evaluator_runs_with_current_names(
+        provider_results, details.get("evaluators") or []
+    )
 
     # Enrich each result row with a presigned audio URL from the dataset.
     # Only presign IDs that actually appear in results to avoid unnecessary

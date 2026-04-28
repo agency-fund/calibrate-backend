@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from db import (
     create_simulation,
@@ -20,16 +20,18 @@ from db import (
     delete_simulation,
     get_persona,
     get_scenario,
-    get_metric,
+    get_evaluator,
+    get_evaluator_uuid_for_legacy_metric,
+    legacy_metric_uuid_exists,
     add_persona_to_simulation,
     add_scenario_to_simulation,
-    add_metric_to_simulation,
+    add_evaluator_to_simulation,
     remove_persona_from_simulation,
     remove_scenario_from_simulation,
-    remove_metric_from_simulation,
+    remove_evaluator_from_simulation,
     get_personas_for_simulation,
     get_scenarios_for_simulation,
-    get_metrics_for_simulation,
+    get_evaluators_for_simulation,
     get_agent,
     get_tools_for_agent,
     create_simulation_job,
@@ -39,6 +41,7 @@ from db import (
     get_simulation_jobs_for_simulation,
     delete_simulation_job,
 )
+from llm_judge import build_evaluator_cli_payload
 from utils import (
     TaskStatus,
     TaskCreateResponse,
@@ -92,7 +95,7 @@ def _start_simulation_job_from_queue(job: dict) -> bool:
     # Get linked entities
     personas = get_personas_for_simulation(simulation_uuid)
     scenarios = get_scenarios_for_simulation(simulation_uuid)
-    metrics = get_metrics_for_simulation(simulation_uuid)
+    evaluators = get_evaluators_for_simulation(simulation_uuid)
 
     if not personas or not scenarios:
         return False
@@ -100,7 +103,7 @@ def _start_simulation_job_from_queue(job: dict) -> bool:
     # Start background task in a separate thread
     thread = threading.Thread(
         target=run_simulation_task,
-        args=(job_id, agent, personas, scenarios, metrics, s3_bucket, job_type),
+        args=(job_id, agent, personas, scenarios, evaluators, s3_bucket, job_type),
         daemon=True,
     )
     thread.start()
@@ -270,20 +273,93 @@ def _get_audio_urls_from_s3_key(
         return []
 
 
+class EvaluatorRef(BaseModel):
+    """Reference to an evaluator attached to a simulation. The pivot pins the evaluator's live
+    version at write time."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evaluator_uuid: str
+    variable_values: Optional[Dict[str, Any]] = None
+
+
 class SimulationCreate(BaseModel):
+    """Create body must use `evaluators` with evaluator UUIDs — not legacy metric UUIDs or aliases."""
+
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     agent_uuid: Optional[str] = None
     persona_uuids: Optional[List[str]] = None
     scenario_uuids: Optional[List[str]] = None
-    metric_uuids: Optional[List[str]] = None
+    evaluators: Optional[List[EvaluatorRef]] = None
 
 
 class SimulationUpdate(BaseModel):
+    """Update body must use `evaluators` with evaluator UUIDs — not legacy metric UUIDs or aliases."""
+
+    model_config = ConfigDict(extra="forbid")
+
     name: Optional[str] = None
     agent_uuid: Optional[str] = None
     persona_uuids: Optional[List[str]] = None
     scenario_uuids: Optional[List[str]] = None
-    metric_uuids: Optional[List[str]] = None
+    evaluators: Optional[List[EvaluatorRef]] = None
+
+
+def _resolve_simulation_evaluator_ref(
+    ref: EvaluatorRef, user_id: str
+) -> Dict[str, Any]:
+    """Resolve and validate one simulation evaluator link. Rejects legacy `metrics.uuid` values."""
+    evaluator_uuid = ref.evaluator_uuid.strip()
+    evaluator = get_evaluator(evaluator_uuid)
+    if not evaluator:
+        migrated = get_evaluator_uuid_for_legacy_metric(evaluator_uuid)
+        if migrated:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Simulations accept evaluator UUIDs only, not legacy metric UUIDs. "
+                    f"Replace {evaluator_uuid} with evaluator UUID {migrated}."
+                ),
+            )
+        if legacy_metric_uuid_exists(evaluator_uuid):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Simulations accept evaluator UUIDs only, not legacy metric UUIDs. "
+                    "This UUID matches a legacy metric row that has no migrated evaluator."
+                ),
+            )
+        raise HTTPException(
+            status_code=404,
+            detail=f"Evaluator {evaluator_uuid} not found",
+        )
+    if evaluator.get("owner_user_id") is not None and evaluator["owner_user_id"] != user_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Evaluator {evaluator_uuid} not found",
+        )
+    if evaluator.get("evaluator_type") != "simulation":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Evaluator {evaluator_uuid} has evaluator_type="
+                f"'{evaluator.get('evaluator_type')}'. Simulations only accept "
+                f"'simulation' evaluators."
+            ),
+        )
+    version_uuid = evaluator.get("live_version_id")
+    if not version_uuid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Evaluator {evaluator_uuid} has no live version",
+        )
+    return {
+        "evaluator_uuid": evaluator_uuid,
+        "version_uuid": version_uuid,
+        "variable_values": ref.variable_values,
+    }
 
 
 class PersonaResponse(BaseModel):
@@ -303,13 +379,20 @@ class ScenarioResponse(BaseModel):
     updated_at: str
 
 
-class MetricResponse(BaseModel):
+class EvaluatorResponse(BaseModel):
     uuid: str
     name: str
     description: Optional[str] = None
-    config: Optional[Dict[str, Any]] = None
-    created_at: str
-    updated_at: str
+    evaluator_type: str = "simulation"
+    data_type: str = "text"
+    kind: str = "single"
+    output_type: str = "binary"
+    output_config: Optional[Dict[str, Any]] = None
+    evaluator_version_id: str
+    version_number: int
+    judge_model: str
+    variables: Optional[List[Dict[str, Any]]] = None
+    variable_values: Optional[Dict[str, Any]] = None
 
 
 class AgentSummaryResponse(BaseModel):
@@ -337,7 +420,7 @@ class SimulationDetailResponse(BaseModel):
     updated_at: str
     personas: List[PersonaResponse]
     scenarios: List[ScenarioResponse]
-    metrics: List[MetricResponse]
+    evaluators: List[EvaluatorResponse]
 
 
 class SimulationCreateResponse(BaseModel):
@@ -360,6 +443,16 @@ class EvaluationCriterionResult(BaseModel):
     name: str
     value: float
     reasoning: str
+    evaluator_uuid: Optional[str] = None
+    description: Optional[str] = None
+
+
+class SimulationEvaluatorRef(BaseModel):
+    """Running snapshot order matches calibrate `evaluators` / per-row IDs in evaluation_results."""
+
+    evaluator_uuid: str
+    name: str  # Current DB name at response time (for stable links use evaluator_uuid)
+    description: Optional[str] = None  # Current DB description at response time
 
 
 class SimulationCaseResult(BaseModel):
@@ -398,6 +491,7 @@ class SimulationRunStatusResponse(BaseModel):
     )
     metrics: Optional[Dict[str, Any]] = None
     simulation_results: Optional[List[SimulationCaseResult]] = None
+    evaluators: Optional[List[SimulationEvaluatorRef]] = None
     error: Optional[str] = None
     is_public: bool = False
     share_token: Optional[str] = None
@@ -415,11 +509,67 @@ class SimulationRunsResponse(BaseModel):
     runs: List[SimulationRunListItem]
 
 
+def _snapshot_evaluators_for_job_details(
+    evaluators: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """Persist ordered evaluator UUIDs on the job (same order as calibrate config)."""
+    return [
+        {
+            "uuid": ev["uuid"],
+            "name": ev.get("name") or "",
+        }
+        for ev in evaluators
+        if ev.get("uuid")
+    ]
+
+
+def apply_simulation_job_evaluator_enrichment(
+    details: Dict[str, Any],
+    simulation_results: Optional[List[Any]],
+) -> tuple[Optional[List[SimulationEvaluatorRef]], Optional[List[Any]]]:
+    """Attach evaluator_uuid from each evaluation_results row's echoed evaluator_id."""
+    snaps = details.get("evaluators") or []
+    refs: List[SimulationEvaluatorRef] = []
+    current_by_uuid: Dict[str, Optional[Dict[str, Any]]] = {}
+    for s in snaps:
+        if isinstance(s, dict) and s.get("uuid"):
+            uid = s["uuid"]
+            ev = get_evaluator(uid)
+            current_by_uuid[uid] = ev
+            refs.append(
+                SimulationEvaluatorRef(
+                    evaluator_uuid=uid,
+                    name=(ev["name"] if ev else None) or s.get("name") or "",
+                    description=ev.get("description") if ev else None,
+                )
+            )
+    if simulation_results:
+        for sim in simulation_results:
+            if not isinstance(sim, dict):
+                continue
+            er = sim.get("evaluation_results")
+            if not isinstance(er, list):
+                continue
+            for row in er:
+                if not isinstance(row, dict):
+                    continue
+                echoed_id = row.get("evaluator_id")
+                if echoed_id:
+                    row["evaluator_uuid"] = echoed_id
+                    ev = current_by_uuid.get(echoed_id)
+                    if echoed_id not in current_by_uuid:
+                        ev = get_evaluator(echoed_id)
+                        current_by_uuid[echoed_id] = ev
+                    row["description"] = ev.get("description") if ev else None
+    top = refs if refs else None
+    return top, simulation_results
+
+
 @router.post("", response_model=SimulationCreateResponse)
 async def create_simulation_endpoint(
     simulation: SimulationCreate, user_id: str = Depends(get_current_user_id)
 ):
-    """Create a new simulation with optional linked agent, personas, scenarios, and metrics."""
+    """Create a new simulation with optional linked agent, personas, scenarios, and evaluators."""
     # Verify agent exists if provided
     if simulation.agent_uuid:
         agent = get_agent(simulation.agent_uuid)
@@ -444,14 +594,10 @@ async def create_simulation_endpoint(
                     status_code=404, detail=f"Scenario {scenario_uuid} not found"
                 )
 
-    # Verify all metrics exist
-    if simulation.metric_uuids:
-        for metric_uuid in simulation.metric_uuids:
-            metric = get_metric(metric_uuid)
-            if not metric:
-                raise HTTPException(
-                    status_code=404, detail=f"Metric {metric_uuid} not found"
-                )
+    resolved_evaluator_refs: List[Dict[str, Any]] = []
+    if simulation.evaluators:
+        for ref in simulation.evaluators:
+            resolved_evaluator_refs.append(_resolve_simulation_evaluator_ref(ref, user_id))
 
     # Create the simulation
     simulation_uuid = create_simulation(
@@ -468,10 +614,13 @@ async def create_simulation_endpoint(
         for scenario_uuid in simulation.scenario_uuids:
             add_scenario_to_simulation(simulation_uuid, scenario_uuid)
 
-    # Add metrics to simulation
-    if simulation.metric_uuids:
-        for metric_uuid in simulation.metric_uuids:
-            add_metric_to_simulation(simulation_uuid, metric_uuid)
+    for ref in resolved_evaluator_refs:
+        add_evaluator_to_simulation(
+            simulation_uuid,
+            evaluator_id=ref["evaluator_uuid"],
+            evaluator_version_id=ref["version_uuid"],
+            variable_values=ref["variable_values"],
+        )
 
     return SimulationCreateResponse(
         uuid=simulation_uuid, message="Simulation created successfully"
@@ -617,7 +766,6 @@ async def get_simulation_run_status(
 
                 for sim_result in simulation_results:
                     # Generate audio URLs from S3 path
-                    print("yolhooo")
                     audios_s3_key_prefix = sim_result.get("audios_s3_path")
                     if audios_s3_key_prefix:
                         audio_urls = _get_audio_urls_from_s3_key(
@@ -651,6 +799,10 @@ async def get_simulation_run_status(
         # For in-progress status: presigned URLs are already stored in results during monitoring
         # Just return them as-is (they were generated when the audio files were uploaded)
 
+    evaluators_out, simulation_results = apply_simulation_job_evaluator_enrichment(
+        details, simulation_results
+    )
+
     return SimulationRunStatusResponse(
         task_id=task_id,
         name=run_name,
@@ -661,6 +813,7 @@ async def get_simulation_run_status(
         completed_simulations=results.get("completed_simulations"),
         metrics=results.get("metrics"),
         simulation_results=simulation_results,
+        evaluators=evaluators_out,
         error=results.get("error"),
         is_public=bool(job.get("is_public")),
         share_token=job.get("share_token"),
@@ -719,7 +872,7 @@ async def get_simulation_runs(
 async def get_simulation_endpoint(
     simulation_uuid: str, user_id: str = Depends(get_current_user_id)
 ):
-    """Get a simulation by UUID with all linked agent, personas, scenarios, and metrics."""
+    """Get a simulation by UUID with all linked agent, personas, scenarios, and evaluators."""
     simulation = get_simulation(simulation_uuid)
     if not simulation:
         raise HTTPException(status_code=404, detail="Simulation not found")
@@ -745,7 +898,7 @@ async def get_simulation_endpoint(
     # Get linked entities
     personas = get_personas_for_simulation(simulation_uuid)
     scenarios = get_scenarios_for_simulation(simulation_uuid)
-    metrics = get_metrics_for_simulation(simulation_uuid)
+    evaluators = get_evaluators_for_simulation(simulation_uuid)
 
     return SimulationDetailResponse(
         uuid=simulation["uuid"],
@@ -755,7 +908,7 @@ async def get_simulation_endpoint(
         updated_at=simulation["updated_at"],
         personas=personas,
         scenarios=scenarios,
-        metrics=metrics,
+        evaluators=evaluators,
     )
 
 
@@ -765,7 +918,7 @@ async def update_simulation_endpoint(
     simulation: SimulationUpdate,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Update a simulation with optional linked agent, personas, scenarios, and metrics."""
+    """Update a simulation with optional linked agent, personas, scenarios, and evaluators."""
     existing_simulation = get_simulation(simulation_uuid)
     if not existing_simulation:
         raise HTTPException(status_code=404, detail="Simulation not found")
@@ -798,14 +951,10 @@ async def update_simulation_endpoint(
                     status_code=404, detail=f"Scenario {scenario_uuid} not found"
                 )
 
-    # Verify all new metrics exist
-    if simulation.metric_uuids is not None:
-        for metric_uuid in simulation.metric_uuids:
-            metric = get_metric(metric_uuid)
-            if not metric:
-                raise HTTPException(
-                    status_code=404, detail=f"Metric {metric_uuid} not found"
-                )
+    resolved_evaluator_refs: List[Dict[str, Any]] = []
+    if simulation.evaluators is not None:
+        for ref in simulation.evaluators:
+            resolved_evaluator_refs.append(_resolve_simulation_evaluator_ref(ref, user_id))
 
     # Update simulation name and/or agent if provided
     if simulation.name is not None or simulation.agent_uuid is not None:
@@ -843,15 +992,18 @@ async def update_simulation_endpoint(
         for scenario_uuid in simulation.scenario_uuids:
             add_scenario_to_simulation(simulation_uuid, scenario_uuid)
 
-    # Update metrics if provided (replace existing)
-    if simulation.metric_uuids is not None:
-        # Remove existing metrics
-        existing_metrics = get_metrics_for_simulation(simulation_uuid)
-        for metric in existing_metrics:
-            remove_metric_from_simulation(simulation_uuid, metric["uuid"])
-        # Add new metrics
-        for metric_uuid in simulation.metric_uuids:
-            add_metric_to_simulation(simulation_uuid, metric_uuid)
+    # Update evaluators if provided (replace existing)
+    if simulation.evaluators is not None:
+        existing_evaluators = get_evaluators_for_simulation(simulation_uuid)
+        for evaluator in existing_evaluators:
+            remove_evaluator_from_simulation(simulation_uuid, evaluator["uuid"])
+        for ref in resolved_evaluator_refs:
+            add_evaluator_to_simulation(
+                simulation_uuid,
+                evaluator_id=ref["evaluator_uuid"],
+                evaluator_version_id=ref["version_uuid"],
+                variable_values=ref["variable_values"],
+            )
 
     # Return full detail response
     updated_simulation = get_simulation(simulation_uuid)
@@ -872,7 +1024,7 @@ async def update_simulation_endpoint(
 
     personas = get_personas_for_simulation(simulation_uuid)
     scenarios = get_scenarios_for_simulation(simulation_uuid)
-    metrics = get_metrics_for_simulation(simulation_uuid)
+    evaluators = get_evaluators_for_simulation(simulation_uuid)
 
     return SimulationDetailResponse(
         uuid=updated_simulation["uuid"],
@@ -882,7 +1034,7 @@ async def update_simulation_endpoint(
         updated_at=updated_simulation["updated_at"],
         personas=personas,
         scenarios=scenarios,
-        metrics=metrics,
+        evaluators=evaluators,
     )
 
 
@@ -911,17 +1063,17 @@ def _build_calibrate_simulation_config(
     agent: Dict[str, Any],
     personas: List[Dict[str, Any]],
     scenarios: List[Dict[str, Any]],
-    metrics: List[Dict[str, Any]],
+    evaluators: List[Dict[str, Any]],
     simulation_type: str = "text",
 ) -> Dict[str, Any]:
     """
-    Build the calibrate simulation config from agent, personas, scenarios, and metrics.
+    Build the calibrate simulation config from agent, personas, scenarios, and evaluators.
 
     Args:
         agent: Agent dict with config containing system_prompt and llm.model
         personas: List of persona dicts with description and config (containing gender, language)
         scenarios: List of scenario dicts with description
-        metrics: List of metric dicts with name and description (for evaluation_criteria)
+        evaluators: List of evaluator link dicts (from get_evaluators_for_simulation)
         simulation_type: Type of simulation - "text" or "voice"
     """
     agent_config = agent.get("config") or {}
@@ -949,12 +1101,10 @@ def _build_calibrate_simulation_config(
         for s in scenarios
     ]
 
-    # Build evaluation criteria (same for both modes)
-    evaluation_criteria = [
-        {"name": m.get("name"), "description": m.get("description") or m.get("name")}
-        for m in metrics
-        if m.get("name")
-    ]
+    # Build full evaluator payload for the calibrate CLI (minimal shape: name, system_prompt,
+    # judge_model, type, scale_min/scale_max for rating). Variables in the system prompt are
+    # pre-substituted because simulations don't have a per-row arguments mechanism.
+    evaluators_payload = build_evaluator_cli_payload(evaluators)
 
     settings_config = agent_config.get("settings", {})
     shared_settings = {
@@ -969,7 +1119,7 @@ def _build_calibrate_simulation_config(
             "agent_url": agent_config["agent_url"],
             "personas": persona_list,
             "scenarios": scenario_list,
-            "evaluation_criteria": evaluation_criteria,
+            "evaluators": evaluators_payload,
             "settings": shared_settings,
         }
         if agent_config.get("agent_headers"):
@@ -988,7 +1138,7 @@ def _build_calibrate_simulation_config(
         "tools": tool_configs,
         "personas": persona_list,
         "scenarios": scenario_list,
-        "evaluation_criteria": evaluation_criteria,
+        "evaluators": evaluators_payload,
         "settings": shared_settings,
     }
 
@@ -1062,7 +1212,9 @@ def _parse_text_simulation_directory(
                 for row in reader:
                     eval_results.append(
                         {
+                            "evaluator_id": row.get("evaluator_id"),
                             "name": row.get("name"),
+                            "type": row.get("type"),
                             "value": row.get("value"),
                             "reasoning": row.get("reasoning", ""),
                         }
@@ -1442,7 +1594,9 @@ def _parse_simulation_directory(
             for row in reader:
                 eval_results.append(
                     {
+                        "evaluator_id": row.get("evaluator_id"),
                         "name": row.get("name"),
+                        "type": row.get("type"),
                         "value": row.get("value"),
                         "reasoning": row.get("reasoning", ""),
                     }
@@ -1996,7 +2150,7 @@ def run_simulation_task(
     agent: Dict[str, Any],
     personas: List[Dict[str, Any]],
     scenarios: List[Dict[str, Any]],
-    metrics: List[Dict[str, Any]],
+    evaluators: List[Dict[str, Any]],
     s3_bucket: str,
     simulation_type: str = "text",
 ):
@@ -2005,7 +2159,7 @@ def run_simulation_task(
         logger.info(
             f"Running {simulation_type} simulation task {task_id} for agent {agent['uuid']} "
             f"with {len(personas)} persona(s), {len(scenarios)} scenario(s), "
-            f"and {len(metrics)} metric(s)"
+            f"and {len(evaluators)} evaluator(s)"
         )
         update_simulation_job(task_id, status=TaskStatus.IN_PROGRESS.value)
 
@@ -2016,7 +2170,7 @@ def run_simulation_task(
             try:
                 # Build calibrate config
                 calibrate_config = _build_calibrate_simulation_config(
-                    agent, personas, scenarios, metrics, simulation_type=simulation_type
+                    agent, personas, scenarios, evaluators, simulation_type=simulation_type
                 )
 
                 # Create input and output directories
@@ -2133,10 +2287,10 @@ async def run_simulation_endpoint(
     user_id: str = Depends(get_current_user_id),
 ):
     """
-    Run a simulation with personas, scenarios, and metrics.
+    Run a simulation with personas, scenarios, and linked evaluators.
 
     This starts a background task that runs the calibrate LLM simulations command
-    with the agent's config and the simulation's personas, scenarios, and metrics.
+    with the agent's config and the simulation's personas, scenarios, and evaluators.
 
     Uses the agent linked to the simulation and its LLM model configuration.
 
@@ -2181,7 +2335,7 @@ async def run_simulation_endpoint(
     # Get linked entities
     personas = get_personas_for_simulation(simulation_uuid)
     scenarios = get_scenarios_for_simulation(simulation_uuid)
-    metrics = get_metrics_for_simulation(simulation_uuid)
+    evaluators = get_evaluators_for_simulation(simulation_uuid)
 
     if not personas:
         raise HTTPException(
@@ -2216,6 +2370,7 @@ async def run_simulation_endpoint(
             "simulation_uuid": simulation_uuid,
             "agent_uuid": agent_uuid,
             "s3_bucket": s3_bucket,
+            "evaluators": _snapshot_evaluators_for_job_details(evaluators),
         },
         results=None,
     )
@@ -2224,7 +2379,7 @@ async def run_simulation_endpoint(
         # Start background task in a separate thread
         thread = threading.Thread(
             target=run_simulation_task,
-            args=(job_id, agent, personas, scenarios, metrics, s3_bucket, request.type),
+            args=(job_id, agent, personas, scenarios, evaluators, s3_bucket, request.type),
             daemon=True,
         )
         thread.start()
@@ -2289,9 +2444,15 @@ async def abort_simulation_run(
     # Try to start the next queued job
     try_start_queued_simulation_job(SIMULATION_JOB_TYPES)
 
-    # Re-read the job to get the updated_at timestamp
+    # Re-read the job to get the updated_at timestamp and merged details
     updated_job = get_simulation_job(job_uuid)
     updated_at = updated_job["updated_at"] if updated_job else ""
+    results = (updated_job or {}).get("results") or {}
+    abort_details = (updated_job or {}).get("details") or {}
+    abort_simulation_results = results.get("simulation_results") or []
+    evaluators_out, abort_simulation_results = apply_simulation_job_evaluator_enrichment(
+        abort_details, abort_simulation_results
+    )
 
     # Calculate run name
     run_name = "Run 1"
@@ -2312,8 +2473,11 @@ async def abort_simulation_run(
         total_simulations=results.get("total_simulations"),
         completed_simulations=results.get("completed_simulations"),
         metrics=results.get("metrics"),
-        simulation_results=simulation_results,
+        simulation_results=abort_simulation_results,
+        evaluators=evaluators_out,
         error=results.get("error"),
+        is_public=bool(updated_job.get("is_public")) if updated_job else False,
+        share_token=updated_job.get("share_token") if updated_job else None,
     )
 
 
