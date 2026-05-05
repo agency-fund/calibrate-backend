@@ -2,7 +2,7 @@
 
 [![CC BY-SA 4.0][cc-by-sa-shield]][cc-by-sa]
 
-Backend for [Calibrate](https://calibrate.artpark.ai): Evaluation platform for **AI agents** (both text and voice agents).
+Backend for [Calibrate](https://calibrate.artpark.ai): an AI evaluation platform for non-profits
 
 ## Installation
 
