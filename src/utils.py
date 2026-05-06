@@ -18,6 +18,35 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 
+def env_str(var: str, fallback: str) -> str:
+    """`os.getenv` with empty string treated as unset.
+
+    Compose passes `${VAR:-}` for optional fields, which arrives as "" not
+    None — `os.getenv(var, fallback)` would then return "" instead of falling
+    back. Using `or` collapses both unset and empty to the fallback.
+    """
+    return os.getenv(var) or fallback
+
+
+def env_bool(var: str, fallback: bool) -> bool:
+    """Parse a truthy/falsy env var. Empty/unset → fallback."""
+    raw = os.getenv(var)
+    if not raw:
+        return fallback
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(var: str, fallback: int) -> int:
+    """Parse an int env var. Empty/unset/unparseable → fallback."""
+    raw = os.getenv(var)
+    if not raw:
+        return fallback
+    try:
+        return int(raw)
+    except ValueError:
+        return fallback
+
+
 def capture_exception_to_sentry(exception: Exception) -> None:
     """
     Capture an exception to Sentry and mark it as unhandled.
@@ -235,20 +264,24 @@ def is_job_timed_out(
 
 
 def get_s3_client():
-    """Get S3 client from environment variables."""
-    aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
-    aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-    aws_region = os.getenv("AWS_REGION", "ap-south-1")
+    """Get S3-compatible client. Honors S3_ENDPOINT_URL for GCS interop.
 
+    Treats empty strings as unset so docker-compose passing through
+    `${AWS_REGION:-}` (etc.) doesn't override the code default with "".
+    """
+    endpoint_url = os.getenv("S3_ENDPOINT_URL") or None
+    aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID") or None
+    aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY") or None
+    aws_region = os.getenv("AWS_REGION") or "ap-south-1"
+
+    kwargs = {"region_name": aws_region}
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
     if aws_access_key_id and aws_secret_access_key:
-        return boto3.client(
-            "s3",
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            region_name=aws_region,
-        )
+        kwargs["aws_access_key_id"] = aws_access_key_id
+        kwargs["aws_secret_access_key"] = aws_secret_access_key
 
-    return boto3.client("s3", region_name=aws_region)
+    return boto3.client("s3", **kwargs)
 
 
 def get_s3_output_config():

@@ -47,10 +47,17 @@ jobs:
 
       - name: Deploy to Production EC2
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          # Forwarded via the action's `envs:` mechanism so the value is exported
+          # on the remote host with proper quoting. Avoids the shell-injection /
+          # corruption risk of interpolating raw secret text into a script body
+          # — system prompts can contain $, backticks, quotes, markdown, etc.
+          DEFAULT_AGENT_SYSTEM_PROMPT: ${{ secrets.DEFAULT_AGENT_SYSTEM_PROMPT }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DEFAULT_AGENT_SYSTEM_PROMPT
           script: |
             set -e  # Exit immediately if any command fails
 
@@ -78,11 +85,25 @@ jobs:
             export OPENROUTER_API_KEY="${{ secrets.OPENROUTER_API_KEY }}"
             export OPENROUTER_ALLOWED_PROVIDERS="${{ vars.OPENROUTER_ALLOWED_PROVIDERS }}"
             export S3_OUTPUT_BUCKET="${{ secrets.S3_OUTPUT_BUCKET }}"
+            export S3_ENDPOINT_URL="${{ secrets.S3_ENDPOINT_URL }}"
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            export AWS_REGION="${{ secrets.AWS_REGION }}"
             export DB_ROOT_DIR="${{ secrets.DB_ROOT_DIR }}"
             export APP_FOLDER_PATH="${{ secrets.APP_FOLDER_PATH }}"
             export DEFAULT_USER_EMAIL="${{ secrets.DEFAULT_USER_EMAIL }}"
             export DEFAULT_USER_FIRST_NAME="${{ secrets.DEFAULT_USER_FIRST_NAME }}"
             export DEFAULT_USER_LAST_NAME="${{ secrets.DEFAULT_USER_LAST_NAME }}"
+            # DEFAULT_AGENT_SYSTEM_PROMPT is injected via the action's `envs:` —
+            # do not export it inline (shell-significant chars in the prompt).
+            export DEFAULT_AGENT_LLM_MODEL="${{ secrets.DEFAULT_AGENT_LLM_MODEL }}"
+            export DEFAULT_AGENT_STT_PROVIDER="${{ secrets.DEFAULT_AGENT_STT_PROVIDER }}"
+            export DEFAULT_AGENT_TTS_PROVIDER="${{ secrets.DEFAULT_AGENT_TTS_PROVIDER }}"
+            export DEFAULT_AGENT_SPEAKS_FIRST="${{ secrets.DEFAULT_AGENT_SPEAKS_FIRST }}"
+            export DEFAULT_AGENT_MAX_TURNS="${{ secrets.DEFAULT_AGENT_MAX_TURNS }}"
+            export DEFAULT_PERSONA_GENDER="${{ secrets.DEFAULT_PERSONA_GENDER }}"
+            export DEFAULT_PERSONA_LANGUAGE="${{ secrets.DEFAULT_PERSONA_LANGUAGE }}"
+            export DEFAULT_PERSONA_INTERRUPTION_SENSITIVITY="${{ secrets.DEFAULT_PERSONA_INTERRUPTION_SENSITIVITY }}"
             export SENTRY_DSN="${{ secrets.SENTRY_DSN }}"
             export SENTRY_ENVIRONMENT="${{ secrets.SENTRY_ENVIRONMENT }}"
             export SENTRY_TRACES_SAMPLE_RATE="${{ secrets.SENTRY_TRACES_SAMPLE_RATE }}"
