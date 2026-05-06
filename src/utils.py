@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 
 import boto3
+from botocore.config import Config
 import openpyxl
 import sentry_sdk
 from pydantic import BaseModel
@@ -268,6 +269,11 @@ def get_s3_client():
 
     Treats empty strings as unset so docker-compose passing through
     `${AWS_REGION:-}` (etc.) doesn't override the code default with "".
+
+    When S3_ENDPOINT_URL is set (i.e. talking to a non-AWS endpoint like GCS),
+    pin checksum behavior to "when_required" — boto3 >=1.36's default
+    "when_supported" adds x-amz-checksum-* headers that GCS's S3 interop layer
+    rejects with SignatureDoesNotMatch. AWS S3 itself handles either setting.
     """
     endpoint_url = os.getenv("S3_ENDPOINT_URL") or None
     aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID") or None
@@ -277,6 +283,10 @@ def get_s3_client():
     kwargs = {"region_name": aws_region}
     if endpoint_url:
         kwargs["endpoint_url"] = endpoint_url
+        kwargs["config"] = Config(
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        )
     if aws_access_key_id and aws_secret_access_key:
         kwargs["aws_access_key_id"] = aws_access_key_id
         kwargs["aws_secret_access_key"] = aws_secret_access_key
