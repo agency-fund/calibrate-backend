@@ -1,0 +1,380 @@
+"""Integration tests for /agent-tests."""
+
+from __future__ import annotations
+
+import uuid
+from unittest.mock import patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+@pytest.fixture(scope="module")
+def app():
+    import main as main_mod
+
+    return main_mod.app
+
+
+@pytest.fixture(scope="module")
+def client(app):
+    with patch("main.recover_pending_jobs"):
+        with TestClient(app) as c:
+            yield c
+
+
+def _signup(client):
+    suffix = uuid.uuid4().hex[:8]
+    body = client.post(
+        "/auth/signup",
+        json={
+            "first_name": "AT",
+            "last_name": "U",
+            "email": f"at-{suffix}@example.com",
+            "password": "passw0rd",
+        },
+    ).json()
+    return {
+        "headers": {"Authorization": f"Bearer {body['access_token']}"},
+        "user_uuid": body["user"]["uuid"],
+    }
+
+
+def _create_agent(client, h, name=None):
+    return client.post(
+        "/agents",
+        json={"name": name or f"a-{uuid.uuid4().hex[:6]}", "type": "agent"},
+        headers=h,
+    ).json()
+
+
+def _create_test(client, h, name=None):
+    evaluators = client.get("/evaluators", headers=h).json()
+    llm_ev = next(e for e in evaluators if e.get("evaluator_type") == "llm")
+    return client.post(
+        "/tests",
+        json={
+            "name": name or f"t-{uuid.uuid4().hex[:6]}",
+            "type": "response",
+            "config": {"history": [], "evaluation": {"type": "response"}},
+            "evaluators": [{"evaluator_uuid": llm_ev["uuid"]}],
+        },
+        headers=h,
+    ).json()
+
+
+# ---------------------------------------------------------------------------
+# Link CRUD
+# ---------------------------------------------------------------------------
+
+
+def test_agent_tests_link_crud(client):
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    test_a = _create_test(client, h)
+    test_b = _create_test(client, h)
+
+    link = client.post(
+        "/agent-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [test_a["uuid"]]},
+    )
+    assert link.status_code == 200
+    # Re-link (idempotent — skip already linked)
+    again = client.post(
+        "/agent-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [test_a["uuid"], test_b["uuid"]]},
+    )
+    assert again.status_code == 200
+
+    # List
+    assert client.get("/agent-tests").status_code == 200
+    assert (
+        client.get(f"/agent-tests/agent/{agent['uuid']}/tests").status_code == 200
+    )
+    assert (
+        client.get(f"/agent-tests/test/{test_a['uuid']}/agents").status_code == 200
+    )
+    assert client.get("/agent-tests/test/missing/agents").status_code == 404
+    assert client.get("/agent-tests/agent/missing/tests").status_code == 404
+    assert client.get("/agent-tests/agent/missing/runs").status_code == 404
+
+    # Runs list (no runs yet)
+    runs = client.get(f"/agent-tests/agent/{agent['uuid']}/runs")
+    assert runs.status_code == 200
+    assert runs.json()["runs"] == []
+
+    # Global runs list (auth required)
+    global_runs = client.get("/agent-tests/runs", headers=h)
+    assert global_runs.status_code == 200
+
+    # Filtered
+    global_runs2 = client.get(
+        "/agent-tests/runs", params={"type": "llm-unit-test"}, headers=h
+    )
+    assert global_runs2.status_code == 200
+
+    # Bulk-unlink validation
+    empty = client.post(
+        "/agent-tests/bulk-unlink",
+        json={"agent_uuid": agent["uuid"], "test_uuids": []},
+    )
+    assert empty.status_code == 400
+    bulk_unlink = client.post(
+        "/agent-tests/bulk-unlink",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [test_a["uuid"]]},
+    )
+    assert bulk_unlink.status_code == 200
+
+    # Bulk-unlink missing agent
+    missing = client.post(
+        "/agent-tests/bulk-unlink",
+        json={"agent_uuid": "missing", "test_uuids": [test_b["uuid"]]},
+    )
+    assert missing.status_code == 404
+
+    # Bulk-delete-tests
+    bulk_del = client.post(
+        "/agent-tests/bulk-delete-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [test_b["uuid"]]},
+        headers=h,
+    )
+    assert bulk_del.status_code == 200
+
+    # Bulk-delete with empty
+    empty_del = client.post(
+        "/agent-tests/bulk-delete-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": []},
+        headers=h,
+    )
+    assert empty_del.status_code == 400
+
+    # Bulk-delete with missing agent
+    missing_del = client.post(
+        "/agent-tests/bulk-delete-tests",
+        json={"agent_uuid": "missing", "test_uuids": ["x"]},
+        headers=h,
+    )
+    assert missing_del.status_code == 404
+
+    # Bulk-delete with foreign agent → 404
+    other = _signup(client)
+    foreign = client.post(
+        "/agent-tests/bulk-delete-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [test_b["uuid"]]},
+        headers=other["headers"],
+    )
+    assert foreign.status_code == 404
+
+
+def test_agent_tests_link_with_missing(client):
+    auth = _signup(client)
+    h = auth["headers"]
+    # Missing agent
+    resp = client.post(
+        "/agent-tests",
+        json={"agent_uuid": "missing-agent", "test_uuids": []},
+    )
+    assert resp.status_code == 404
+
+    agent = _create_agent(client, h)
+    # Missing test
+    bad = client.post(
+        "/agent-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": ["missing-test"]},
+    )
+    assert bad.status_code == 404
+
+
+def test_agent_tests_delete_link_not_found(client):
+    auth = _signup(client)
+    h = auth["headers"]
+    resp = client.request(
+        "DELETE",
+        "/agent-tests",
+        json={"agent_uuid": "x", "test_uuid": "y"},
+    )
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Run + benchmark validations (queue path, no thread)
+# ---------------------------------------------------------------------------
+
+
+def test_run_agent_test_validation(client, monkeypatch):
+    auth = _signup(client)
+    h = auth["headers"]
+
+    # Missing agent
+    resp = client.post("/agent-tests/agent/missing/run", json={})
+    assert resp.status_code == 404
+
+    # Agent with no linked tests
+    agent = _create_agent(client, h)
+    no_tests = client.post(f"/agent-tests/agent/{agent['uuid']}/run", json={})
+    assert no_tests.status_code == 400
+
+    # Provide bogus test_uuids
+    bad = client.post(
+        f"/agent-tests/agent/{agent['uuid']}/run",
+        json={"test_uuids": ["missing"]},
+    )
+    assert bad.status_code == 404
+
+
+def test_run_agent_test_queued_path(client, monkeypatch):
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    test = _create_test(client, h)
+    client.post(
+        "/agent-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [test["uuid"]]},
+    )
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    with patch("routers.agent_tests.can_start_agent_test_job", return_value=False), patch(
+        "threading.Thread"
+    ):
+        resp = client.post(f"/agent-tests/agent/{agent['uuid']}/run", json={})
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+    assert resp.json()["status"] == "queued"
+
+    # Status
+    got = client.get(f"/agent-tests/run/{task_id}")
+    assert got.status_code == 200
+
+    # 404 unknown run
+    assert client.get("/agent-tests/run/missing").status_code == 404
+
+    # Visibility toggle
+    on = client.patch(
+        f"/agent-tests/run/{task_id}/visibility",
+        json={"is_public": True},
+        headers=h,
+    )
+    assert on.status_code == 200
+    off = client.patch(
+        f"/agent-tests/run/{task_id}/visibility",
+        json={"is_public": False},
+        headers=h,
+    )
+    assert off.status_code == 200
+    other = _signup(client)
+    assert (
+        client.patch(
+            f"/agent-tests/run/{task_id}/visibility",
+            json={"is_public": True},
+            headers=other["headers"],
+        ).status_code
+        == 404
+    )
+    assert (
+        client.patch(
+            "/agent-tests/run/missing/visibility",
+            json={"is_public": True},
+            headers=h,
+        ).status_code
+        == 404
+    )
+
+    # Delete
+    deleted = client.delete(f"/agent-tests/job/{task_id}", headers=h)
+    assert deleted.status_code == 200
+    # already gone
+    assert (
+        client.delete(f"/agent-tests/job/{task_id}", headers=h).status_code == 404
+    )
+    assert client.delete("/agent-tests/job/missing", headers=h).status_code == 404
+
+
+def test_run_agent_benchmark_validation(client):
+    auth = _signup(client)
+    h = auth["headers"]
+    # Missing agent
+    resp = client.post("/agent-tests/agent/missing/benchmark", json={"models": ["x"]})
+    assert resp.status_code == 404
+
+    # No models
+    agent = _create_agent(client, h)
+    bad = client.post(
+        f"/agent-tests/agent/{agent['uuid']}/benchmark",
+        json={"models": []},
+    )
+    assert bad.status_code == 400
+
+    # No tests linked
+    no_tests = client.post(
+        f"/agent-tests/agent/{agent['uuid']}/benchmark",
+        json={"models": ["openai/gpt-4"]},
+    )
+    assert no_tests.status_code == 400
+
+
+def test_run_agent_benchmark_queued_path(client, monkeypatch):
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    test = _create_test(client, h)
+    client.post(
+        "/agent-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [test["uuid"]]},
+    )
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    with patch("routers.agent_tests.can_start_agent_test_job", return_value=False), patch(
+        "threading.Thread"
+    ):
+        resp = client.post(
+            f"/agent-tests/agent/{agent['uuid']}/benchmark",
+            json={"models": ["openai/gpt-4"]},
+        )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+    got = client.get(f"/agent-tests/benchmark/{task_id}")
+    assert got.status_code == 200
+    assert client.get("/agent-tests/benchmark/missing").status_code == 404
+
+    # Visibility toggle
+    on = client.patch(
+        f"/agent-tests/benchmark/{task_id}/visibility",
+        json={"is_public": True},
+        headers=h,
+    )
+    assert on.status_code == 200
+    off = client.patch(
+        f"/agent-tests/benchmark/{task_id}/visibility",
+        json={"is_public": False},
+        headers=h,
+    )
+    assert off.status_code == 200
+    assert (
+        client.patch(
+            "/agent-tests/benchmark/missing/visibility",
+            json={"is_public": True},
+            headers=h,
+        ).status_code
+        == 404
+    )
+
+
+def test_agent_test_inflight(client, monkeypatch):
+    """Cover the can_start=True branch where the thread is spawned."""
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    test = _create_test(client, h)
+    client.post(
+        "/agent-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [test["uuid"]]},
+    )
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    with patch("routers.agent_tests.can_start_agent_test_job", return_value=True), patch(
+        "routers.agent_tests.threading.Thread"
+    ) as thread_mock:
+        resp = client.post(f"/agent-tests/agent/{agent['uuid']}/run", json={})
+        assert resp.status_code == 200
+        thread_mock.return_value.start.assert_called_once()
