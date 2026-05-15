@@ -32,7 +32,7 @@ The backend wraps the `calibrate` CLI tool and orchestrates evaluation jobs whil
 | **Containerization** | Docker                              | Deployment                                                                                                                                                                   |
 | **CLI Tool**         | calibrate                           | Core evaluation/simulation engine                                                                                                                                            |
 | **Unit tests**       | pytest + pytest-cov                 | Small regression suite under `tests/`; dev-only deps in `pyproject.toml` `[dependency-groups] dev`                                                                           |
-| **CI**               | GitHub Actions                      | Lint-free pipeline: install via `uv`, run pytest with coverage, upload to Codecov; **production** release deploy (`deploy.yml`) runs the test workflow first via **`needs: test`**. Staging (`deploy-staging.yml`) is **`workflow_dispatch`** only and does **not** gate on tests. |
+| **CI**               | GitHub Actions                      | Lint-free pipeline: install via `uv`, run pytest with coverage, upload to Codecov; **skipped** on push/PR when **only** `*.md` / `**/*.md` changed (`paths-ignore` in `tests.yml`); **`workflow_call`** (e.g. production deploy) always runs tests. **Production** release deploy (`deploy.yml`) gates on **`needs: test`**. Staging (`deploy-staging.yml`) is **`workflow_dispatch`** only and does **not** gate on tests. |
 
 ---
 
@@ -42,7 +42,7 @@ The backend wraps the `calibrate` CLI tool and orchestrates evaluation jobs whil
 calibrate-backend/
 ├── src/
 │   ├── main.py              # FastAPI app entry point, lifespan management
-│   ├── db.py                # SQLite database layer (~5000 lines)
+│   ├── db.py                # SQLite database layer (~7000 lines)
 │   ├── utils.py             # Shared utilities (S3 client/upload helpers, STT/TTS evaluator run pairing, tool config building)
 │   ├── dataset_utils.py     # Dataset resolution helpers for STT/TTS evaluations
 │   ├── job_recovery.py      # Restart in-progress jobs on app startup
@@ -67,8 +67,7 @@ calibrate-backend/
 │       └── user_limits.py   # Per-user limits CRUD and limit queries
 ├── tests/                   # Pytest suite (repo root); imports match runtime (`from llm_judge import …`) via configured pythonpath
 ├── .githooks/               # Git hooks (opt-in): `pre-commit` runs pytest on `main` only — enable with `git config core.hooksPath .githooks`
-├── db/
-│   └── calibrate.db         # SQLite database file
+├── ENV.md                   # Canonical environment variable reference (grouped; backend vs calibrate subprocess)
 ├── pyproject.toml           # App deps + `[dependency-groups] dev` (pytest, pytest-cov) + pytest/coverage tool config
 ├── Dockerfile               # Container build configuration
 ├── docker-compose.yml       # Container orchestration
@@ -77,7 +76,7 @@ calibrate-backend/
 
 ### Automated testing and CI
 
-**Why**: Catch regressions in small, importable modules on every **PR and push to `main`**, and block **production** Docker deploys until that suite passes; surface coverage trends via Codecov (README badge). **Staging** deploys are intentionally **not** blocked by the same gate (see **Gotchas**).
+**Why**: Catch regressions in small, importable modules on **PRs and pushes to `main` that touch non-markdown files**, and block **production** Docker deploys until that suite passes; surface coverage trends via Codecov (README badge). **Docs-only** changes (markdown alone) skip the GitHub test workflow to save CI minutes; **staging** deploys are intentionally **not** blocked by the same gate (see **Gotchas**).
 
 **Layout and conventions**
 
@@ -94,14 +93,16 @@ calibrate-backend/
 
 **GitHub Actions**
 
-- **`tests.yml`** runs on **pushes to `main`**, **pull requests targeting `main`**, and as a **`workflow_call`** reusable workflow. Before **`uv sync`**, it installs **`libasound2-dev`** on the Ubuntu runner (**`alsa/asoundlib.h`**) so **`simpleaudio`** (a transitive dependency of **`calibrate-agent`**) can compile — same class of fix as the Calibrate CLI **agentloop** CI. Then **`uv sync --frozen --group dev`**, **`uv run pytest`** (pytest **`addopts`** include **`--cov=src`**; CI adds **`--cov-report=xml`**). **Codecov** uses **`codecov/codecov-action@v5`** with **`token: ${{ secrets.CODECOV_TOKEN }}`** and **`./coverage.xml`**; **`fail_ci_if_error: false`** avoids blocking merges when the token is missing or Codecov is unavailable.
+- **`tests.yml`** runs on **pushes to `main`**, **pull requests targeting `main`**, and as a **`workflow_call`** reusable workflow. **Push/PR triggers** use **`paths-ignore: ["*.md", "**/*.md"]`** — if every changed file in the event is markdown, the workflow is not scheduled (Codecov upload is skipped too). **Mixed** PRs (e.g. `src/foo.py` + `ENV.md`) still run tests. **`workflow_call`** has no path filter, so **`deploy.yml`** production releases always execute the suite regardless of what files changed in the release tag. Before **`uv sync`**, it installs **`libasound2-dev`** on the Ubuntu runner (**`alsa/asoundlib.h`**) so **`simpleaudio`** (a transitive dependency of **`calibrate-agent`**) can compile — same class of fix as the Calibrate CLI **agentloop** CI. Then **`uv sync --frozen --group dev`**, **`uv run pytest`** (pytest **`addopts`** include **`--cov=src`**; CI adds **`--cov-report=xml`**). **Codecov** uses **`codecov/codecov-action@v5`** with **`token: ${{ secrets.CODECOV_TOKEN }}`** and **`./coverage.xml`**; **`fail_ci_if_error: false`** avoids blocking merges when the token is missing or Codecov is unavailable.
 - **`deploy.yml`** (production, on **release published**) declares a **`test`** job that **`uses: ./.github/workflows/tests.yml`** and gates **`build-and-deploy`** with **`needs: test`**. A failing test suite prevents the production image build/push and EC2 deploy from running. **`deploy-staging.yml`** does **not** invoke the test workflow; it only runs when manually triggered and goes straight to **`build-and-deploy`**.
 
 **Gotchas**
 
 - **Production vs staging**: **`deploy.yml`** always runs **`tests.yml`** first (`workflow_call` + `needs: test`). **`deploy-staging.yml`** goes straight to build/push/deploy so operators can validate infra or hot-fix paths without waiting on the unit suite — accept the trade-off that a broken test run on `main` does not stop a manual staging deploy.
 - **Different CWD**: Developers run the API from **`src/`**; they run tests from the **repo root** (`uv run pytest`). Do not assume `Path.cwd()` matches between tests and runtime unless a test explicitly `chdir`s or uses paths relative to the project root.
-- **Hooks are opt-in**: CI always runs on GitHub; local **`pre-commit`** only runs for clones that set **`core.hooksPath`**. Do not assume every contributor has hooks installed.
+- **Hooks are opt-in**: Local **`pre-commit`** only runs for clones that set **`core.hooksPath`**. Do not assume every contributor has hooks installed.
+- **Docs-only skips tests (CI + hook)**: GitHub **`paths-ignore`** for `*.md` mirrors the local hook, which only runs when staged files include **`.py` or `.json`** — a **`main`** commit that only touches markdown/docs skips both. Do not rely on CI to catch accidental breakage hidden in a docs-only PR; if a doc change implies code behavior changed, include a non-markdown file or run **`uv run --group dev pytest`** locally.
+- **Markdown mixed with code**: Any non-`.md` path in the push/PR diff still triggers **`tests.yml`** — editing `SELF_HOSTING.md` and `src/db.py` in one PR runs the full suite.
 - **Scope**: The suite is intentionally **narrow** (e.g. pure helpers in `llm_judge`, JWT helpers in `auth_utils`). Most routers, `db.py`, and CLI-backed jobs remain **uncovered**; low aggregate coverage percentage is expected until more tests are added.
 - **JWT tests** patch **`auth_utils.JWT_SECRET_KEY`** (and related module attributes) so they do not depend on `.env` secrets and do not collide with production key rotation concerns.
 
@@ -352,7 +353,7 @@ FastAPI's default docs routes are disabled (`docs_url=None`, `redoc_url=None`, `
 
 The queueing mechanism limits concurrent jobs to prevent resource exhaustion. Two levels of limits are enforced:
 
-1. **Global limit**: `MAX_CONCURRENT_JOBS` env var (default from docker-compose: 1)
+1. **Global limit**: `MAX_CONCURRENT_JOBS` — must be set wherever queue helpers run (**no** Python default; **`docker-compose.yml`** supplies **`1`**). See **Configuration** and **`ENV.md`**.
 2. **Per-user limit**: `MAX_CONCURRENT_JOBS_PER_USER` env var (default: 1, set to 0 to disable)
 
 #### Queue Architecture
@@ -959,11 +960,12 @@ Used for:
 - Storing evaluation results (JSON, CSV, Excel files)
 - Presigned URLs for secure file access
 
-Required environment variables:
+Required / common S3-related variables (full list and edge cases in **`ENV.md`**):
 
-- `S3_OUTPUT_BUCKET` - Target bucket for outputs
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (optional, falls back to IAM role)
-- `AWS_REGION` - Default: `ap-south-1`
+- `S3_OUTPUT_BUCKET` — Target bucket for outputs (**required** when presigning or uploading)
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — Optional; empty values are treated as unset (IAM role / other boto3 credential chains may apply)
+- `AWS_REGION` — Default **`ap-south-1`** if unset or empty
+- `S3_ENDPOINT_URL` — Optional S3-compatible endpoint (e.g. GCS interop); when set, checksum behaviour is pinned for non-AWS endpoints ([`src/utils.py`](src/utils.py))
 
 **Uploading files to S3**: Routers use `upload_file_to_s3()` for single objects; **`upload_directory_tree_to_s3()`** and **`upload_top_level_files_to_s3()`** wrap it for directory batches (see STT/TTS and agent test sections). Never call `s3.upload_file(...)` directly for ad-hoc uploads. `upload_file_to_s3` guesses `Content-Type` from the file extension via `mimetypes.guess_type` (e.g. `.json` → `application/json`, `.wav` → `audio/wav`, `.mp3` → `audio/mpeg`). Files **without** an extension (e.g. calibrate's `logs`) get no `ContentType` unless extended later. Without `Content-Type`, boto3 defaults to `binary/octet-stream` for some clients. Existing objects uploaded before `Content-Type` guessing still behave as above.
 
@@ -979,68 +981,27 @@ Required environment variables:
 
 ## Configuration
 
-### Environment Variables
+### Environment variables
 
-```bash
-# Database
-DB_ROOT_DIR=/appdata/db          # Directory containing calibrate.db
+**Canonical reference**: **`ENV.md`** (repository root) documents each variable — purpose, defaults, empty-string semantics, **FastAPI-read** vs **inherited-by-`calibrate`** keys, tracing/Langfuse/OTLP, default agent/persona template envs, and Docker-only compose substitutions. **`src/.env.example`** remains the minimal template checked into git.
 
-# Job Queue
-MAX_CONCURRENT_JOBS=2            # Max concurrent jobs per queue type (docker-compose default: 1)
-MAX_CONCURRENT_JOBS_PER_USER=1   # Max concurrent jobs per user per queue type (default: 1, 0 to disable)
+**Maintenance rule** (also [`.cursor/rules/env-var.md`](env-var.md)): when adding, renaming, or removing variables, update **`src/.env.example`**, **`docker-compose.yml`**, and **`.github/workflows/*`** deploy jobs as needed so local, CI, and production stay consistent.
 
-# User Limits
-DEFAULT_MAX_ROWS_PER_EVAL=500    # Default max rows per eval run; overridden per-user via user_limits table
-SUPERADMIN_EMAIL=admin@example.com  # Email for superadmin access (required for mutating /user-limits endpoints)
+**Why this split**: A long inline env catalogue in this file went stale (wrong DB filename, wrong default for `DEFAULT_MAX_ROWS_PER_EVAL`, misleading `MAX_CONCURRENT_JOBS` default). Behaviour and schema stay here; the full variable matrix lives in **`ENV.md`** to avoid duplication drift.
 
-# CORS
-CORS_ALLOWED_ORIGINS=*           # Comma-separated origins (e.g., "http://localhost:3000,https://app.example.com")
+**Load-bearing facts** (not a complete list — see **`ENV.md`**):
 
-# JWT Authentication
-JWT_SECRET_KEY=your-secret-key   # REQUIRED: At least 32 characters, change in production!
-JWT_EXPIRATION_HOURS=168         # Token validity (default: 7 days)
-
-# API Docs Authentication (HTTP Basic Auth)
-DOCS_USERNAME=admin              # Username for /docs, /redoc, /openapi.json (default: admin)
-DOCS_PASSWORD=changeme           # Password for docs access (default: changeme — change in production!)
-
-# Sentry (Error Tracking)
-SENTRY_DSN=                      # Sentry DSN (leave empty to disable)
-SENTRY_ENVIRONMENT=development   # Environment name (development, staging, production)
-SENTRY_TRACES_SAMPLE_RATE=1.0    # Performance monitoring sample rate (0.0-1.0)
-SENTRY_PROFILES_SAMPLE_RATE=1.0  # Profiling sample rate (0.0-1.0)
-
-# Langfuse Tracing (LLM Observability via OpenTelemetry)
-ENVIRONMENT=development                              # Langfuse tracing environment
-ENABLE_TRACING=true                                  # Enable/disable tracing
-OTEL_EXPORTER_OTLP_ENDPOINT=https://host/api/public/otel  # OTLP endpoint (Langfuse self-hosted or cloud)
-OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20xxx      # Base64-encoded Langfuse public:secret key
-LANGFUSE_TRACING_ENVIRONMENT=                        # Langfuse tracing environment label
-LANGFUSE_HOST=                                       # Langfuse host URL
-LANGFUSE_PUBLIC_KEY=                                 # Langfuse public key
-LANGFUSE_SECRET_KEY=                                 # Langfuse secret key
-
-# AWS
-S3_OUTPUT_BUCKET=your-bucket
-AWS_ACCESS_KEY_ID=xxx
-AWS_SECRET_ACCESS_KEY=xxx
-AWS_REGION=ap-south-1
-
-# Authentication
-GOOGLE_CLIENT_ID=xxx.apps.googleusercontent.com
-
-# Provider API Keys
-OPENAI_API_KEY=xxx
-DEEPGRAM_API_KEY=xxx
-CARTESIA_API_KEY=xxx
-SMALLEST_API_KEY=xxx
-GROQ_API_KEY=xxx
-GOOGLE_API_KEY=xxx
-GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
-SARVAM_API_KEY=xxx
-ELEVENLABS_API_KEY=xxx
-OPENROUTER_API_KEY=xxx
-```
+- **`DB_ROOT_DIR`** — **Required** before importing [`db.py`](src/db.py). SQLite path is **`{DB_ROOT_DIR}/pense.db`** (resolved at import time).
+- **`S3_OUTPUT_BUCKET`** — **Required** for code paths that presign or upload; optional `S3_ENDPOINT_URL` for S3-compatible storage (e.g. GCS interop).
+- **`JWT_SECRET_KEY`**, **`JWT_EXPIRATION_HOURS`** — JWT signing in [`auth_utils.py`](src/auth_utils.py); production must override the weak dev default if the secret is unset.
+- **`MAX_CONCURRENT_JOBS`** — Parsed with **`int(os.getenv(...))`** and **no fallback** in [`utils.py`](src/utils.py); the process expects it to be set wherever queue limits run (tests and **`docker-compose.yml`** use **`1`**). **Gotcha**: unset → `TypeError` when queue helpers run.
+- **`MAX_CONCURRENT_JOBS_PER_USER`** — Defaults to **`1`**; set to **`0`** to disable the per-user cap.
+- **`DEFAULT_MAX_ROWS_PER_EVAL`** — Defaults to **`20`** in [`user_limits.py`](src/routers/user_limits.py) when unset.
+- **`SUPERADMIN_EMAIL`** — JWT email must match for mutating **`/user-limits`** endpoints ([`require_superadmin`](src/auth_utils.py)).
+- **Provider API keys** — Typically consumed by **`calibrate`** subprocesses (inherited env), not by backend Python directly. Exceptions such as **`OPENROUTER_API_KEY`** / **`OPENROUTER_ALLOWED_PROVIDERS`** for **`GET /openrouter/providers`** are called out in **`ENV.md`**.
+- **Default agent/persona template envs** — `DEFAULT_AGENT_*`, `DEFAULT_PERSONA_*` — Read via `env_str` / `env_bool` / `env_int` ([`utils.py`](src/utils.py)): **empty string = unset → code fallback**. **Gotcha**: `.env.example` may show a value that differs from the hardcoded fallback (e.g. `DEFAULT_AGENT_SPEAKS_FIRST`); runtime follows **code** when the var is unset or empty.
+- **Sentry** — Initialized from **`SENTRY_DSN`** at app import; leave DSN empty to disable ([`main.py`](src/main.py)).
+- **Langfuse / OTEL (`ENVIRONMENT`, `ENABLE_TRACING`, `OTEL_*`, `LANGFUSE_*`, plus `LANGFUSE_BASE_URL` in compose)** — Wired through deployment for OTLP/Langfuse consumers and subprocesses; not comprehensively read inside this repo’s Python modules. Details and wiring examples: **`ENV.md`**, **`SELF_HOSTING.md`**.
 
 ### Agent Types
 
