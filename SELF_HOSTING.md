@@ -72,7 +72,15 @@ sudo mkdir /appdata
 sudo chown -R $USER /appdata
 ```
 
-## Install Docker
+The rest of the steps need to be done within the instance (not your laptop).
+
+## 7. Install Docker
+
+```
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER && newgrp docker
+docker run --rm hello-world
+```
 
 ## Clone the repo and build the image
 
