@@ -430,3 +430,65 @@ Use nginx to route your custom domain (e.g. calibrate-backend.<yourdomain.com>) 
 Open `https://<YOUR_DOMAIN>/docs` on your browser. It should load the FastAPI docs.
 
 If your frontend is set up, [create a new speech-to-text dataset](https://calibrate.artpark.ai/docs/core-concepts/speech-to-text#create-a-dataset) and upload one audio. If it uploads successfully, your GCS connection works.
+
+## Automate deployments with GitHub Actions
+
+The repo ships with [.github/workflows/deploy.yml](.github/workflows/deploy.yml) and [.github/workflows/deploy-staging.yml](.github/workflows/deploy-staging.yml). Both build the Docker image, push to Docker Hub, SSH onto the VM, and run `docker compose pull && up -d`. They're cloud-neutral — works for GCE the same as EC2.
+
+### 1. Add an SSH key the workflow can use
+
+GCE defaults to OS Login (Google-identity-based SSH). GitHub Actions can't use that directly, so add a project-wide SSH key the workflow can authenticate with:
+
+```bash
+# On your laptop — generate a dedicated key (don't reuse your personal one)
+ssh-keygen -t ed25519 -f ~/.ssh/calibrate-deploy -C "calibrate-deploy" -N ""
+
+# Disable OS Login on the VM (uses metadata-based SSH keys instead)
+gcloud compute instances add-metadata calibrate-backend-prod \
+  --zone=<zone> --metadata=enable-oslogin=FALSE
+
+# Add the public key to the instance
+gcloud compute instances add-metadata calibrate-backend-prod \
+  --zone=<zone> \
+  --metadata="ssh-keys=ubuntu:$(cat ~/.ssh/calibrate-deploy.pub)"
+```
+
+Test from your laptop: `ssh -i ~/.ssh/calibrate-deploy ubuntu@<STATIC_IP>` should log you in.
+
+### 2. Set GitHub Actions environment secrets
+
+Go to **GitHub → Repo settings → Environments → New environment** named `Production` (or `Staging`). Add these secrets:
+
+| Secret | Value |
+|---|---|
+| `VM_HOST` | The VM's static IP |
+| `VM_USER` | `ubuntu` (or whatever username matches the SSH key) |
+| `VM_SSH_KEY` | Contents of `~/.ssh/calibrate-deploy` (the **private** key) |
+| `DOCKERHUB_USERNAME` / `DOCKERHUB_PASSWORD` | Docker Hub credentials for image push |
+| `IMAGE_NAME` / `CONTAINER_NAME` / `PORT` | Match your `.env` on the VM |
+| `APP_FOLDER_PATH` / `DB_ROOT_DIR` | `/appdata` |
+| `JWT_SECRET_KEY` | Same as on the VM |
+| `S3_ENDPOINT_URL` | `https://storage.googleapis.com` |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | HMAC keys |
+| `AWS_REGION` | `auto` |
+| `S3_OUTPUT_BUCKET` | Your GCS bucket name |
+| `GOOGLE_CLIENT_ID` | OAuth client ID |
+| `SUPERADMIN_EMAIL` / `DEFAULT_USER_*` | Same as on the VM |
+| `DOCS_USERNAME` / `DOCS_PASSWORD` | Same as on the VM |
+| Provider API keys (`OPENROUTER_API_KEY` etc.) | As needed |
+| `SENTRY_*`, `LANGFUSE_*`, etc. | Optional |
+| `MAX_CONCURRENT_JOBS` / `MAX_CONCURRENT_JOBS_PER_USER` / `DEFAULT_MAX_ROWS_PER_EVAL` | Match your `.env` |
+
+Plus environment **variable** (not secret): `IMAGE_TAG` = `latest` (or whatever tag you want pushed).
+
+### 3. Trigger a deploy
+
+GitHub → **Actions** → **Deploy to Production** → **Run workflow** → choose the branch → Run.
+
+Watch the run. If SSH connects and `docker compose up -d` succeeds, you're set — subsequent deploys are one click.
+
+### Common gotchas
+
+- **Firewall**: port 22 must be open to the GitHub Actions runner. Either keep `default-allow-ssh` as-is (0.0.0.0/0) or restrict to GitHub's runner IP ranges (changes periodically — keep an eye on [GitHub's meta endpoint](https://api.github.com/meta)).
+- **First deploy** still requires the manual `docker build` you did locally — the workflow expects the image already in Docker Hub. Push it once: `docker tag calibrate-backend:local <your-dockerhub-user>/calibrate-backend:latest && docker push <your-dockerhub-user>/calibrate-backend:latest`. Subsequent deploys build + push automatically.
+- **Compose project name**: the workflow uses `docker compose -p pense-production` for project isolation. If you started the container manually with a different project name, the workflow will spin up a parallel container instead of replacing yours — stop the old one with `docker compose down` once the workflow is green.
