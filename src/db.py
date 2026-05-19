@@ -6984,7 +6984,7 @@ def get_evaluators_for_annotation_task(task_id: str) -> List[Dict[str, Any]]:
              WHERE ate.task_id = ?
                AND ate.deleted_at IS NULL
                AND e.deleted_at IS NULL
-             ORDER BY ate.created_at ASC
+             ORDER BY ate.created_at ASC, ate.id ASC
             """,
             (task_id,),
         )
