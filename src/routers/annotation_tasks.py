@@ -1811,7 +1811,10 @@ async def task_summary(
             continue
         if v_id:
             versions_by_evaluator.setdefault(ev_id, set()).add(v_id)
-        if r_item_id in scoped_item_ids:
+        # Only count runs that actually produced a label. Failed runs leave
+        # `value` NULL and would otherwise inflate the count beyond what an
+        # annotator/FE would think of as a "label".
+        if r_item_id in scoped_item_ids and r.get("value") is not None:
             run_count_by_evaluator[ev_id] = (
                 run_count_by_evaluator.get(ev_id, 0) + 1
             )
