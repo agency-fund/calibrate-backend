@@ -842,6 +842,90 @@ def test_annotation_pipeline(user):
     ]
     assert ordered_after == [other["uuid"], seeded["uuid"]]
 
+    # Explicit reorder: caller-supplied order wins over insertion order, and
+    # the change is visible to every read path that lists task evaluators.
+    db.reorder_evaluators_for_annotation_task(
+        task_uuid, [seeded["uuid"], other["uuid"]]
+    )
+    ordered_explicit = [
+        e["uuid"] for e in db.get_evaluators_for_annotation_task(task_uuid)
+    ]
+    assert ordered_explicit == [seeded["uuid"], other["uuid"]]
+    positions = [
+        e["position"] for e in db.get_evaluators_for_annotation_task(task_uuid)
+    ]
+    assert positions == [1, 2]
+
+    # Reorder validates membership — extra/missing IDs raise.
+    with pytest.raises(ValueError):
+        db.reorder_evaluators_for_annotation_task(task_uuid, [seeded["uuid"]])
+    with pytest.raises(ValueError):
+        db.reorder_evaluators_for_annotation_task(
+            task_uuid, [seeded["uuid"], other["uuid"], other["uuid"]]
+        )
+    bogus = "00000000-0000-0000-0000-000000000000"
+    with pytest.raises(ValueError):
+        db.reorder_evaluators_for_annotation_task(
+            task_uuid, [seeded["uuid"], bogus]
+        )
+
+    # Job snapshot freezes the order at creation time. Snapshot now while
+    # order is [seeded, other], then flip the task order — the job keeps
+    # its frozen view.
+    snapshot_items = db.create_annotation_items(
+        task_uuid, [{"payload": {"name": _u("snap-item")}}]
+    )
+    snapshot_ann = db.create_annotator(
+        name=_u("snap-ann"), user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    snap_job = db.create_annotation_job(
+        task_id=task_uuid,
+        annotator_id=snapshot_ann,
+        item_uuids=snapshot_items,
+        public_token=_u("snap-token"),
+    )
+    job_order_before = db.get_evaluator_ids_for_job(snap_job)
+    assert job_order_before == [seeded["uuid"], other["uuid"]]
+    db.reorder_evaluators_for_annotation_task(
+        task_uuid, [other["uuid"], seeded["uuid"]]
+    )
+    assert db.get_evaluator_ids_for_job(snap_job) == [seeded["uuid"], other["uuid"]]
+    # Task-level read reflects the new order.
+    assert [
+        e["uuid"] for e in db.get_evaluators_for_annotation_task(task_uuid)
+    ] == [other["uuid"], seeded["uuid"]]
+    # Restore for the rest of the test.
+    db.reorder_evaluators_for_annotation_task(
+        task_uuid, [seeded["uuid"], other["uuid"]]
+    )
+
+    # Reorder must IGNORE pivot rows whose evaluator has been soft-deleted on
+    # the `evaluators` table. `delete_evaluator` doesn't cascade to the pivot
+    # (the link's `deleted_at` stays NULL), but `get_evaluators_for_annotation_task`
+    # JOINs and filters `e.deleted_at IS NULL` — so clients can't see those
+    # UUIDs. If the validator counted them, every task with a deleted-but-still-
+    # linked evaluator would 400 forever. Custom evaluator (org-owned) so
+    # delete_evaluator is allowed; seeded defaults are protected.
+    custom_ev = db.create_evaluator(
+        name=_u("ev-soft-delete"),
+        owner_user_id=user["uuid"],
+        org_uuid=user["org_uuid"],
+    )
+    db.add_evaluator_to_annotation_task(task_uuid, custom_ev)
+    visible_before = [
+        e["uuid"] for e in db.get_evaluators_for_annotation_task(task_uuid)
+    ]
+    assert custom_ev in visible_before
+    assert db.delete_evaluator(custom_ev) is True
+    visible_after = [
+        e["uuid"] for e in db.get_evaluators_for_annotation_task(task_uuid)
+    ]
+    # FE no longer sees the deleted evaluator on the task.
+    assert custom_ev not in visible_after
+    # Reorder using only the FE-visible ids must succeed (validator must
+    # exclude the deleted evaluator from its "current" set).
+    db.reorder_evaluators_for_annotation_task(task_uuid, visible_after)
+
     # annotator
     ann_uuid = db.create_annotator(name=_u("ann"), user_id=user["uuid"], org_uuid=user["org_uuid"])
     assert db.get_annotator(ann_uuid)
