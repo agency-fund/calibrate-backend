@@ -718,18 +718,37 @@ def _build_calibrate_config(
             "variable_values": {"criteria": criteria_text},
         }
 
+    # Both `response` and `conversation` tests carry a list of evaluators that
+    # calibrate references by name per test case (`evaluation.criteria`). They
+    # differ only in how calibrate judges each row (response ⇒ judge a generated
+    # reply; conversation ⇒ judge the supplied transcript), which calibrate
+    # decides from `evaluation.type` — the evaluator payload is identical.
+    #
+    # The IMMUTABLE row `type` is authoritative here, not `config.evaluation.type`:
+    # `PUT /tests` keeps the row `type` fixed but accepts an arbitrary `config`
+    # dict, so a stored `evaluation.type` can drift from what the test actually
+    # is (and what its evaluators were validated against). We dispatch on the row
+    # type and normalize `evaluation.type` to it below, so a drifted config can
+    # never make calibrate judge the wrong way.
     tests_with_evaluators: List[Dict[str, Any]] = []
     for test in tests:
         test_config = test.get("config")
         if not test_config:
             continue
         evaluation = test_config.get("evaluation", {})
-        if evaluation.get("type") != "response":
+        if test.get("type") not in ("response", "conversation"):
             continue
 
         linked_evaluators = get_evaluators_for_test(test["uuid"])
 
-        if not linked_evaluators:
+        # Legacy string-criteria fallback is RESPONSE-ONLY: it synthesizes the
+        # `default-llm-next-reply` LLM evaluator, which must never be attached to
+        # a conversation test (those are validated to use `simulation`
+        # evaluators). A conversation test can reach here with no linked
+        # evaluators (the create path only validates refs when provided), so
+        # gating on the row type keeps the evaluator-type contract intact —
+        # such a test simply contributes no evaluators.
+        if not linked_evaluators and test.get("type") == "response":
             legacy_criteria = evaluation.get("criteria")
             if isinstance(legacy_criteria, str) and legacy_criteria.strip():
                 synth = _synthetic_default_llm_link(legacy_criteria)
@@ -808,7 +827,15 @@ def _build_calibrate_config(
         test_config["id"] = test["uuid"]
         evaluation = test_config.get("evaluation", {})
 
-        if evaluation.get("type") == "tool_call":
+        # The immutable row `type` wins over a possibly-drifted
+        # `config.evaluation.type` (see first-pass note). Normalize the value
+        # calibrate dispatches on so it always matches what the test is and what
+        # its evaluators were validated against.
+        row_type = test.get("type")
+        evaluation["type"] = row_type
+        test_config["evaluation"] = evaluation
+
+        if row_type == "tool_call":
             tool_calls = []
             for tool_call in evaluation.get("tool_calls", []):
                 tool_calls.append(
@@ -822,9 +849,12 @@ def _build_calibrate_config(
                     }
                 )
             evaluation["tool_calls"] = tool_calls
-        elif evaluation.get("type") == "response":
-            # Legacy string criteria are promoted to a synthetic evaluator link in the
-            # first pass; overwrite with structured refs from criteria_per_test.
+        elif row_type in ("response", "conversation"):
+            # Reference the top-level evaluators by name (with per-test {{var}}
+            # arguments). For `response`, legacy string criteria were promoted to a
+            # synthetic evaluator link in the first pass; either way we overwrite
+            # with the structured refs from criteria_per_test. `conversation` rows
+            # keep their `history` and carry no `output`/`tool_calls`.
             evaluation["criteria"] = criteria_per_test.get(test["uuid"], [])
 
         all_test_cases.append(test_config)
@@ -1455,13 +1485,31 @@ def _update_agent_test_intermediate_results(
     return completed_count
 
 
+# ============ Conversation tests ============
+#
+# A conversation-type test runs in LIVE mode through the *same* `calibrate llm`
+# command and output shape as response/tool_call tests: a top-level `evaluators`
+# list plus per-test-case `evaluation = {type: "conversation", criteria:
+# [{name, arguments?}]}`, with `history` ending at the user turn the agent
+# should answer. Each row's `evaluation.type` tells calibrate how to handle it:
+#   - response   ⇒ run the agent, judge only its generated reply
+#   - conversation ⇒ run the agent, append its reply, judge the FULL conversation
+#   - tool_call  ⇒ run the agent, diff the tool calls
+# All three invoke the agent, so conversation tests flow through the normal
+# `_build_calibrate_config` / `run_llm_test_task` path and are subject to the
+# same agent-connection-verified guard — see `_build_calibrate_config`.
+
+
 def run_llm_test_task(
     task_id: str,
     agent: Dict[str, Any],
     tests: List[Dict[str, Any]],
     s3_bucket: str,
 ):
-    """Run the LLM tests in the background using a single CLI command with intermediate updates."""
+    """Run the LLM tests in the background using a single CLI command with intermediate updates.
+
+    Handles response, tool_call, and conversation test cases uniformly — the
+    calibrate CLI dispatches per row on each test case's `evaluation.type`."""
     try:
         logger.info(
             f"Running LLM test task {task_id} for agent {agent['uuid']} with {len(tests)} test(s)"
@@ -1763,7 +1811,11 @@ async def run_agent_test(agent_uuid: str, request: RunTestRequest):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    # Guard: agent connection must be verified before running tests
+    # Guard: agent connection must be verified before running tests. Every test
+    # type runs the agent — response/tool_call generate the reply to judge, and
+    # conversation tests run in live mode too (calibrate runs the agent on the
+    # `history`, appends the generated reply, then the simulation judge scores
+    # the full conversation). So the guard applies uniformly.
     agent_config = agent.get("config") or {}
     if agent_config.get("agent_url") and not agent_config.get("connection_verified"):
         raise HTTPException(

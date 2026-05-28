@@ -63,6 +63,44 @@ def _create_test(client, h, name=None):
     ).json()
 
 
+def _create_simulation_evaluator(client, h, name=None):
+    """Create a simulation-type evaluator (no default is seeded for this type)."""
+    return client.post(
+        "/evaluators",
+        json={
+            "name": name or f"sim-ev-{uuid.uuid4().hex[:6]}",
+            "evaluator_type": "simulation",
+            "output_type": "binary",
+            "version": {
+                "judge_model": "openai/gpt-4.1",
+                "system_prompt": "Judge the whole conversation.",
+            },
+        },
+        headers=h,
+    ).json()
+
+
+def _create_conversation_test(client, h, name=None, sim_ev_uuid=None):
+    if sim_ev_uuid is None:
+        sim_ev_uuid = _create_simulation_evaluator(client, h)["uuid"]
+    return client.post(
+        "/tests",
+        json={
+            "name": name or f"conv-{uuid.uuid4().hex[:6]}",
+            "type": "conversation",
+            "config": {
+                "history": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ],
+                "evaluation": {"type": "conversation"},
+            },
+            "evaluators": [{"evaluator_uuid": sim_ev_uuid}],
+        },
+        headers=h,
+    ).json()
+
+
 # ---------------------------------------------------------------------------
 # Link CRUD
 # ---------------------------------------------------------------------------
@@ -288,6 +326,189 @@ def test_run_agent_test_queued_path(client, monkeypatch):
         client.delete(f"/agent-tests/job/{task_id}", headers=h).status_code == 404
     )
     assert client.delete("/agent-tests/job/missing", headers=h).status_code == 404
+
+
+def test_run_conversation_test_queued_path(client, monkeypatch):
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    conv = _create_conversation_test(client, h)
+    assert conv.get("uuid"), conv
+    client.post(
+        "/agent-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [conv["uuid"]]},
+    )
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    with patch(
+        "routers.agent_tests.can_start_agent_test_job", return_value=False
+    ), patch("threading.Thread"):
+        resp = client.post(f"/agent-tests/agent/{agent['uuid']}/run", json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "queued"
+    task_id = resp.json()["task_id"]
+
+    # Conversation tests flow through the normal calibrate-llm config: the
+    # frozen calibrate_config carries the conversation test case (with its
+    # evaluation.type + criteria) and the top-level evaluators list.
+    import db
+
+    job = db.get_agent_test_job(task_id)
+    details = job["details"]
+    cfg = details["calibrate_config"]
+    assert cfg.get("evaluators"), cfg
+    case = next(c for c in cfg["test_cases"] if c["id"] == conv["uuid"])
+    assert case["evaluation"]["type"] == "conversation"
+    assert case["evaluation"]["criteria"]
+    assert conv["uuid"] in details["evaluators_by_test_id"]
+
+    # Status endpoint serializes fine for a conversation run.
+    got = client.get(f"/agent-tests/run/{task_id}")
+    assert got.status_code == 200
+
+    # Clean up the queued job so it doesn't pollute the shared session DB
+    # (try_start_queued_agent_test_job picks the oldest queued job).
+    assert client.delete(f"/agent-tests/job/{task_id}", headers=h).status_code == 200
+
+
+def test_run_mixed_conversation_and_response_allowed(client, monkeypatch):
+    """The calibrate CLI dispatches per test case on evaluation.type, so a run
+    may mix conversation with response tests in a single job."""
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    response_test = _create_test(client, h)
+    conv = _create_conversation_test(client, h)
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    with patch(
+        "routers.agent_tests.can_start_agent_test_job", return_value=False
+    ), patch("threading.Thread"):
+        resp = client.post(
+            f"/agent-tests/agent/{agent['uuid']}/run",
+            json={"test_uuids": [response_test["uuid"], conv["uuid"]]},
+        )
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["task_id"]
+
+    import db
+
+    cfg = db.get_agent_test_job(task_id)["details"]["calibrate_config"]
+    types = {c["evaluation"]["type"] for c in cfg["test_cases"]}
+    assert types == {"response", "conversation"}
+
+    assert client.delete(f"/agent-tests/job/{task_id}", headers=h).status_code == 200
+
+
+def test_benchmark_allows_conversation_tests(client, monkeypatch):
+    """Conversation rows ignore the benchmarked model, but a benchmark that
+    includes them is still accepted (handled by the same calibrate-llm path)."""
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    conv = _create_conversation_test(client, h)
+    client.post(
+        "/agent-tests",
+        json={"agent_uuid": agent["uuid"], "test_uuids": [conv["uuid"]]},
+    )
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    with patch(
+        "routers.agent_tests.can_start_agent_test_job", return_value=False
+    ), patch("threading.Thread"):
+        resp = client.post(
+            f"/agent-tests/agent/{agent['uuid']}/benchmark",
+            json={"models": ["openai/gpt-4"]},
+        )
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["task_id"]
+    assert client.delete(f"/agent-tests/job/{task_id}", headers=h).status_code == 200
+
+
+def test_unverified_connection_blocks_all_test_types(client, monkeypatch):
+    """Every test type runs the agent (conversation tests are live too), so an
+    unverified agent-connection agent blocks response AND conversation runs."""
+    import db
+
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    # Agent-connection agent that hasn't been verified.
+    db.update_agent(
+        agent["uuid"],
+        config={"agent_url": "http://agent.local/run", "connection_verified": False},
+    )
+
+    response_test = _create_test(client, h)
+    conv = _create_conversation_test(client, h)
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+
+    for test_uuid in (response_test["uuid"], conv["uuid"]):
+        blocked = client.post(
+            f"/agent-tests/agent/{agent['uuid']}/run",
+            json={"test_uuids": [test_uuid]},
+        )
+        assert blocked.status_code == 400, blocked.text
+        assert "not verified" in blocked.json()["detail"].lower()
+
+
+def test_drifted_config_eval_type_follows_immutable_row_type(client, monkeypatch):
+    """The immutable row `type` is authoritative: a conversation-typed test whose
+    stored config.evaluation.type has drifted to "response" is normalized back to
+    conversation at CLI handoff, so calibrate dispatches it as a conversation."""
+    import db
+
+    auth = _signup(client)
+    h = auth["headers"]
+    # Plain (calibrate-agent-mode) agent — no agent_url, so the connection guard
+    # doesn't apply and we can inspect the built config.
+    agent = _create_agent(client, h)
+    sim_ev = _create_simulation_evaluator(client, h)["uuid"]
+    # Schema lets config be arbitrary while row `type` is immutable, so this
+    # divergent state is reachable via the API.
+    drifted = client.post(
+        "/tests",
+        json={
+            "name": f"mm-{uuid.uuid4().hex[:6]}",
+            "type": "conversation",
+            "config": {"history": [], "evaluation": {"type": "response"}},
+            "evaluators": [{"evaluator_uuid": sim_ev}],
+        },
+        headers=h,
+    ).json()
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "test-bucket")
+    with patch(
+        "routers.agent_tests.can_start_agent_test_job", return_value=False
+    ), patch("threading.Thread"):
+        resp = client.post(
+            f"/agent-tests/agent/{agent['uuid']}/run",
+            json={"test_uuids": [drifted["uuid"]]},
+        )
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["task_id"]
+    # The built calibrate config normalizes evaluation.type to the row type.
+    cfg = db.get_agent_test_job(task_id)["details"]["calibrate_config"]
+    case = next(c for c in cfg["test_cases"] if c["id"] == drifted["uuid"])
+    assert case["evaluation"]["type"] == "conversation"
+    assert client.delete(f"/agent-tests/job/{task_id}", headers=h).status_code == 200
+
+
+def test_run_agent_test_missing_s3_config_500(client, monkeypatch):
+    auth = _signup(client)
+    h = auth["headers"]
+    agent = _create_agent(client, h)
+    conv = _create_conversation_test(client, h)
+
+    with patch(
+        "routers.agent_tests.get_s3_output_config",
+        side_effect=ValueError("no bucket configured"),
+    ):
+        resp = client.post(
+            f"/agent-tests/agent/{agent['uuid']}/run",
+            json={"test_uuids": [conv["uuid"]]},
+        )
+    assert resp.status_code == 500
 
 
 def test_run_agent_benchmark_validation(client):

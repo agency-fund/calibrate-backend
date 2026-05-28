@@ -359,6 +359,272 @@ def test_run_benchmark_task_failure_path():
 
 
 # ---------------------------------------------------------------------------
+# Conversation tests — run through the same `calibrate llm` path as response
+# tests (run_llm_test_task); calibrate dispatches per row on evaluation.type.
+# ---------------------------------------------------------------------------
+
+
+def _make_conversation_test(db_mod, org_uuid, user_uuid, name="Conv"):
+    """Create a conversation-type test linked to a simulation evaluator."""
+    ev_uuid = db_mod.create_evaluator(
+        name=f"sim-ev-{os.urandom(4).hex()}",
+        evaluator_type="simulation",
+        output_type="binary",
+        owner_user_id=user_uuid,
+        org_uuid=org_uuid,
+    )
+    version = db_mod.create_evaluator_version(
+        ev_uuid, judge_model="m", system_prompt="judge"
+    )
+    db_mod.set_evaluator_live_version(ev_uuid, version["uuid"])
+    test_uuid = db_mod.create_test(
+        name=f"{name}-{os.urandom(4).hex()}",
+        type="conversation",
+        config={
+            "history": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+            "evaluation": {"type": "conversation"},
+        },
+        org_uuid=org_uuid,
+        user_id=user_uuid,
+    )
+    db_mod.set_test_evaluators(
+        test_uuid, [{"evaluator_id": ev_uuid, "variable_values": None}]
+    )
+    return test_uuid, ev_uuid
+
+
+def _write_conversation_llm_output(output_dir: Path, test_uuid: str, ev_name: str):
+    """Mimic `calibrate llm` output for a conversation test case: per-model
+    results.json + metrics.json (same shape as response tests). Conversation
+    runs live — the agent's generated reply is in `output.response` and the full
+    conversation is judged; `passed` is computed by calibrate."""
+    model_dir = output_dir / "gpt-4.1"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    with open(model_dir / "results.json", "w") as f:
+        json.dump(
+            [
+                {
+                    "output": {"response": "It shipped yesterday.", "tool_calls": []},
+                    "metrics": {
+                        "passed": True,
+                        "reasoning": "All evaluators passed",
+                        "judge_results": {
+                            ev_name: {"reasoning": "ok", "match": True}
+                        },
+                    },
+                    "test_case": {
+                        "id": test_uuid,
+                        "history": [],
+                        "evaluation": {"type": "conversation"},
+                    },
+                    "test_case_id": test_uuid,
+                }
+            ],
+            f,
+        )
+    with open(model_dir / "metrics.json", "w") as f:
+        json.dump({"total": 1, "passed": 1, "criteria": {}, "tool_calls": {}}, f)
+
+
+def test_build_calibrate_config_includes_conversation_tests():
+    """Conversation tests must land in the top-level evaluators list AND get
+    per-test-case `evaluation.criteria` refs, exactly like response tests."""
+    from routers.agent_tests import _build_calibrate_config
+
+    user_uuid = db.create_user("R", "BC", f"rbc-{os.urandom(4).hex()}@x.com")
+    org_uuid = db.get_personal_org_for_user(user_uuid)["uuid"]
+    agent_uuid = db.create_agent(
+        name=f"a-{os.urandom(4).hex()}", org_uuid=org_uuid, user_id=user_uuid
+    )
+    test_uuid, ev_uuid = _make_conversation_test(db, org_uuid, user_uuid)
+    agent = db.get_agent(agent_uuid)
+    test = db.get_test(test_uuid)
+
+    config, evaluators_by_test_id = _build_calibrate_config(agent, [test])
+
+    # Top-level evaluators list carries the linked simulation evaluator.
+    assert config.get("evaluators"), config
+    ev_names = {e["name"] for e in config["evaluators"]}
+    # The test case keeps evaluation.type == conversation and references the
+    # evaluator by name in criteria (calibrate dispatches on the type).
+    case = next(c for c in config["test_cases"] if c["id"] == test_uuid)
+    assert case["evaluation"]["type"] == "conversation"
+    assert case["evaluation"]["criteria"]
+    assert case["evaluation"]["criteria"][0]["name"] in ev_names
+    # Snapshot is built for the read path.
+    assert test_uuid in evaluators_by_test_id
+
+
+def test_conversation_test_no_legacy_llm_evaluator_fallback():
+    """The legacy string-criteria fallback synthesizes the default-llm-next-reply
+    LLM evaluator and must be RESPONSE-ONLY. A conversation test with no linked
+    evaluators but a stringy `evaluation.criteria` must NOT pick it up (that would
+    judge a transcript with an LLM next-reply prompt, violating the
+    evaluator-type contract)."""
+    from routers.agent_tests import _build_calibrate_config
+
+    user_uuid = db.create_user("R", "NF", f"rnf-{os.urandom(4).hex()}@x.com")
+    org_uuid = db.get_personal_org_for_user(user_uuid)["uuid"]
+    agent_uuid = db.create_agent(
+        name=f"a-{os.urandom(4).hex()}", org_uuid=org_uuid, user_id=user_uuid
+    )
+    # Conversation test, no evaluators linked, with a legacy string criteria.
+    conv_uuid = db.create_test(
+        name=f"convnf-{os.urandom(4).hex()}",
+        type="conversation",
+        config={"history": [], "evaluation": {"type": "conversation", "criteria": "be nice"}},
+        org_uuid=org_uuid,
+        user_id=user_uuid,
+    )
+    agent = db.get_agent(agent_uuid)
+    config, evaluators_by_test_id = _build_calibrate_config(agent, [db.get_test(conv_uuid)])
+
+    # No synthetic LLM evaluator attached; the string criteria is overwritten
+    # with an empty structured-refs list.
+    assert not config.get("evaluators")
+    assert conv_uuid not in evaluators_by_test_id
+    case = next(c for c in config["test_cases"] if c["id"] == conv_uuid)
+    assert case["evaluation"]["type"] == "conversation"
+    assert case["evaluation"]["criteria"] == []
+
+
+def test_build_calibrate_config_tool_call_branch():
+    """Exercise the tool_call branch of _build_calibrate_config (and the
+    `elif type in (response, conversation)` false-path) alongside a conversation
+    test in the same config."""
+    from routers.agent_tests import _build_calibrate_config
+
+    user_uuid = db.create_user("R", "TC", f"rtc-{os.urandom(4).hex()}@x.com")
+    org_uuid = db.get_personal_org_for_user(user_uuid)["uuid"]
+    agent_uuid = db.create_agent(
+        name=f"a-{os.urandom(4).hex()}", org_uuid=org_uuid, user_id=user_uuid
+    )
+    tool_test_uuid = db.create_test(
+        name=f"tc-{os.urandom(4).hex()}",
+        type="tool_call",
+        config={
+            "history": [{"role": "user", "content": "book it"}],
+            "evaluation": {
+                "type": "tool_call",
+                "tool_calls": [{"tool": "book", "arguments": {"id": 1}}],
+            },
+        },
+        org_uuid=org_uuid,
+        user_id=user_uuid,
+    )
+    conv_uuid, _ = _make_conversation_test(db, org_uuid, user_uuid)
+    # A test whose (row) type is neither tool_call nor response/conversation
+    # exercises the defensive fall-through (appended untouched). The db layer
+    # doesn't constrain `type`, so this state is reachable even though the API
+    # Literal wouldn't allow it.
+    other_uuid = db.create_test(
+        name=f"other-{os.urandom(4).hex()}",
+        type="weird",
+        config={"history": [], "evaluation": {"type": "weird"}},
+        org_uuid=org_uuid,
+        user_id=user_uuid,
+    )
+    agent = db.get_agent(agent_uuid)
+    tests = [
+        db.get_test(tool_test_uuid),
+        db.get_test(conv_uuid),
+        db.get_test(other_uuid),
+    ]
+
+    config, _ = _build_calibrate_config(agent, tests)
+    by_type = {c["evaluation"]["type"]: c for c in config["test_cases"]}
+    assert by_type["tool_call"]["evaluation"]["tool_calls"][0]["tool"] == "book"
+    assert by_type["conversation"]["evaluation"]["criteria"]
+    # Dispatch follows the row type (normalized), and unknown types fall through
+    # appended without criteria/tool_calls.
+    assert "weird" in by_type
+    assert "criteria" not in by_type["weird"]["evaluation"]
+
+
+def test_run_conversation_test_task_success():
+    from routers.agent_tests import run_llm_test_task
+
+    user_uuid = db.create_user("R", "C", f"rc-{os.urandom(4).hex()}@x.com")
+    org_uuid = db.get_personal_org_for_user(user_uuid)["uuid"]
+    agent_uuid = db.create_agent(
+        name=f"a-{os.urandom(4).hex()}", org_uuid=org_uuid, user_id=user_uuid
+    )
+    test_uuid, ev_uuid = _make_conversation_test(db, org_uuid, user_uuid)
+    test = db.get_test(test_uuid)
+    ev_name = db.get_evaluator(ev_uuid)["name"]
+    job_uuid = db.create_agent_test_job(
+        agent_id=agent_uuid, job_type="llm-unit-test", status="in_progress"
+    )
+
+    process = _FakeProcess(returncode=0, poll_results=[None, 0])
+
+    def fake_popen(*args, **kwargs):
+        output_dir = Path(kwargs["cwd"]) / "output"
+        if output_dir.exists():
+            _write_conversation_llm_output(output_dir, test_uuid, ev_name)
+        return process
+
+    with patch(
+        "routers.agent_tests.subprocess.Popen", side_effect=fake_popen
+    ), patch(
+        "routers.agent_tests.get_s3_client", return_value=MagicMock()
+    ), patch("routers.agent_tests.upload_directory_tree_to_s3"), patch(
+        "routers.agent_tests.upload_file_to_s3"
+    ), patch(
+        "routers.agent_tests.try_start_queued_agent_test_job"
+    ), patch(
+        "routers.agent_tests.time.sleep"
+    ):
+        agent = {"uuid": agent_uuid, "name": "a", "config": {}}
+        run_llm_test_task(job_uuid, agent, [test], "bucket")
+
+    job = db.get_agent_test_job(job_uuid)
+    assert job["status"] == "done"
+    results = job["results"]
+    assert results["total_tests"] == 1
+    assert results["passed"] == 1
+    row = results["test_results"][0]
+    assert row["passed"] is True
+    assert row["test_case_id"] == test_uuid
+
+
+def test_run_conversation_test_task_calibrate_failure():
+    """A failing calibrate run for the only test → job FAILED."""
+    from routers.agent_tests import run_llm_test_task
+
+    user_uuid = db.create_user("R", "C", f"rcf-{os.urandom(4).hex()}@x.com")
+    org_uuid = db.get_personal_org_for_user(user_uuid)["uuid"]
+    agent_uuid = db.create_agent(
+        name=f"a-{os.urandom(4).hex()}", org_uuid=org_uuid, user_id=user_uuid
+    )
+    test_uuid, _ = _make_conversation_test(db, org_uuid, user_uuid)
+    test = db.get_test(test_uuid)
+    job_uuid = db.create_agent_test_job(
+        agent_id=agent_uuid, job_type="llm-unit-test", status="in_progress"
+    )
+
+    process = _FakeProcess(returncode=1, poll_results=[None, 1])
+    with patch(
+        "routers.agent_tests.subprocess.Popen", return_value=process
+    ), patch(
+        "routers.agent_tests.get_s3_client", return_value=MagicMock()
+    ), patch("routers.agent_tests.upload_directory_tree_to_s3"), patch(
+        "routers.agent_tests.try_start_queued_agent_test_job"
+    ), patch(
+        "routers.agent_tests.time.sleep"
+    ):
+        agent = {"uuid": agent_uuid, "name": "a", "config": {}}
+        run_llm_test_task(job_uuid, agent, [test], "bucket")
+
+    job = db.get_agent_test_job(job_uuid)
+    assert job["status"] == "failed"
+    assert job["results"]["error"]
+
+
+# ---------------------------------------------------------------------------
 # Simulation run_simulation_task — failure path only
 # ---------------------------------------------------------------------------
 
