@@ -563,6 +563,145 @@ def test_tests_router_crud(client):
     )
 
 
+def test_tests_router_type_validation(client):
+    auth = _auth(client)
+    h = auth["headers"]
+
+    evaluators = client.get("/evaluators", headers=h).json()
+    llm_ev = next(e for e in evaluators if e.get("evaluator_type") == "llm")
+
+    # Unknown `type` rejected by Pydantic Literal — 422.
+    bad_type = client.post(
+        "/tests",
+        json={
+            "name": f"t-{uuid.uuid4().hex[:6]}",
+            "type": "garbage",
+            "config": None,
+        },
+        headers=h,
+    )
+    assert bad_type.status_code == 422
+
+    # Create a user-owned simulation evaluator (no seeded simulation defaults).
+    sim_ev = client.post(
+        "/evaluators",
+        json={
+            "name": f"sim-{uuid.uuid4().hex[:6]}",
+            "description": "d",
+            "evaluator_type": "simulation",
+            "data_type": "text",
+            "kind": "single",
+            "output_type": "binary",
+            "version": {
+                "judge_model": "openai/gpt-4",
+                "system_prompt": "Judge the conversation",
+            },
+        },
+        headers=h,
+    )
+    assert sim_ev.status_code == 200
+    sim_ev_uuid = sim_ev.json()["uuid"]
+
+    # conversation + simulation evaluator → 200
+    conv_create = client.post(
+        "/tests",
+        json={
+            "name": f"conv-{uuid.uuid4().hex[:6]}",
+            "type": "conversation",
+            "config": None,
+            "evaluators": [{"evaluator_uuid": sim_ev_uuid}],
+        },
+        headers=h,
+    )
+    assert conv_create.status_code == 200
+    conv_uuid = conv_create.json()["uuid"]
+
+    # conversation + llm evaluator → 400
+    conv_bad = client.post(
+        "/tests",
+        json={
+            "name": f"conv-bad-{uuid.uuid4().hex[:6]}",
+            "type": "conversation",
+            "config": None,
+            "evaluators": [{"evaluator_uuid": llm_ev["uuid"]}],
+        },
+        headers=h,
+    )
+    assert conv_bad.status_code == 400
+
+    # response + simulation evaluator → 400
+    resp_bad = client.post(
+        "/tests",
+        json={
+            "name": f"resp-bad-{uuid.uuid4().hex[:6]}",
+            "type": "response",
+            "config": None,
+            "evaluators": [{"evaluator_uuid": sim_ev_uuid}],
+        },
+        headers=h,
+    )
+    assert resp_bad.status_code == 400
+
+    # Update existing conversation test with an llm evaluator → 400
+    upd_bad = client.put(
+        f"/tests/{conv_uuid}",
+        json={"evaluators": [{"evaluator_uuid": llm_ev["uuid"]}]},
+        headers=h,
+    )
+    assert upd_bad.status_code == 400
+
+    # Type is immutable: changing it on an existing test → 400.
+    type_change = client.put(
+        f"/tests/{conv_uuid}",
+        json={"type": "response"},
+        headers=h,
+    )
+    assert type_change.status_code == 400
+
+    # Echoing the same type back is a harmless no-op → 200.
+    same_type = client.put(
+        f"/tests/{conv_uuid}",
+        json={"type": "conversation"},
+        headers=h,
+    )
+    assert same_type.status_code == 200
+
+    # Bulk upload of a conversation test without evaluators → 422 (the
+    # model validator requires at least one evaluator for conversation type).
+    bulk_no_ev = client.post(
+        "/tests/bulk",
+        json={
+            "type": "conversation",
+            "tests": [
+                {
+                    "name": f"bulk-conv-{uuid.uuid4().hex[:6]}",
+                    "conversation_history": [{"role": "user", "content": "hi"}],
+                }
+            ],
+        },
+        headers=h,
+    )
+    assert bulk_no_ev.status_code == 422
+
+
+def test_validate_evaluators_rejects_unknown_test_type():
+    """Defensive guard: an evaluator-validation call for a test type not in
+    the compatibility map 400s before touching any evaluator. Reachable only
+    via a legacy/corrupt stored `type` (the API Literal blocks it at the
+    request layer), so exercise the helper directly."""
+    from fastapi import HTTPException
+    from routers.tests import EvaluatorRef, _validate_evaluators
+
+    with pytest.raises(HTTPException) as exc:
+        _validate_evaluators(
+            [EvaluatorRef(evaluator_uuid="whatever")],
+            org_uuid="org-1",
+            test_type="bogus-type",
+        )
+    assert exc.value.status_code == 400
+    assert "Unknown test type" in exc.value.detail
+
+
 # ---------------------------------------------------------------------------
 # Annotators router
 # ---------------------------------------------------------------------------
