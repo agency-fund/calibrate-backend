@@ -7,6 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Commit when the work is done — don't wait to be asked.** Once all the required changes for a task are made and the scoped tests pass, create the commit yourself. Use a focused message that explains the *why*. Do not push unless explicitly asked. The standard safety rules still apply: never amend published commits, never skip hooks, never `git add -A` blindly, never commit secrets.
 - **Keep CLAUDE.md in sync with the app's mental model.** After making changes, ask yourself: does this commit shift a *high-level* understanding of the app — a load-bearing invariant, an architectural rule, a convention, a non-obvious gotcha, a new subsystem, or a contract between components? If yes, update CLAUDE.md in the **same commit** so future Claude sessions inherit the new mental model. Don't record routine fixes, file moves, renames, or anything obvious from reading the code — only changes a fresh reader would otherwise miss. When in doubt, prefer updating an existing bullet over adding a new one.
 
+## Parallel execution (default)
+
+For any multi-step or multi-file task, first write a short plan that splits the work into subtasks and marks which are independent. Run independent subtasks as parallel agents, each owning a disjoint set of files/sections so they never edit the same file at once. Keep dependent subtasks sequential. Show the plan before launching. See the `parallelize` skill for the full playbook.
+
 ## Project Summary
 
 Calibrate Backend is a FastAPI REST API that wraps the `calibrate` CLI tool to orchestrate long-running evaluation and simulation jobs:
