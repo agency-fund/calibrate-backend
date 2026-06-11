@@ -595,6 +595,89 @@ def test_agent_tests_pivot_and_test_evaluators(user):
         db.set_test_evaluators(test_uuid, [{"evaluator_id": no_live}])
 
 
+def test_get_evaluators_for_test_resolves_live_version(user):
+    """A test run must always use the evaluator's CURRENT live version, not the
+    version pinned on the pivot at link time. Editing the evaluator (new live
+    version) after linking changes what get_evaluators_for_test returns, even
+    though the pivot's evaluator_version_id still points at the old version."""
+    test_uuid = db.create_test(
+        name=_u("t-live"), type="llm", user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    ev_uuid = db.create_evaluator(
+        name=_u("ev-live"), owner_user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    v1 = db.create_evaluator_version(ev_uuid, judge_model="m", system_prompt="PROMPT V1")
+    db.set_evaluator_live_version(ev_uuid, v1["uuid"])
+
+    # Link at v1 (set_test_evaluators pins live-at-link-time = v1 on the pivot).
+    db.set_test_evaluators(test_uuid, [{"evaluator_id": ev_uuid}])
+    linked = db.get_evaluators_for_test(test_uuid)
+    assert len(linked) == 1
+    assert linked[0]["evaluator_version_id"] == v1["uuid"]  # live == v1 here
+    assert linked[0]["system_prompt"] == "PROMPT V1"
+    assert linked[0]["version_number"] == 1
+
+    # Edit the evaluator: new version becomes live. Do NOT re-link.
+    v2 = db.create_evaluator_version(ev_uuid, judge_model="m", system_prompt="PROMPT V2")
+    db.set_evaluator_live_version(ev_uuid, v2["uuid"])
+
+    relinked = db.get_evaluators_for_test(test_uuid)
+    # All three describe the SAME (live) version v2 — the row is internally
+    # consistent even though the pivot still pins v1 in the DB.
+    assert relinked[0]["evaluator_version_id"] == v2["uuid"]
+    assert relinked[0]["system_prompt"] == "PROMPT V2"
+    assert relinked[0]["version_number"] == 2
+
+
+def test_evaluator_variables_are_immutable_across_versions(user):
+    """Variable names are frozen after the first version. A new version must
+    declare the same variable name set; renaming/adding/removing one is rejected.
+    This guards the live-resolution path: a test's pinned variable_values must
+    always still fill the live prompt's {{placeholders}}."""
+    ev_uuid = db.create_evaluator(
+        name=_u("ev-immut"), owner_user_id=user["uuid"], org_uuid=user["org_uuid"]
+    )
+    db.create_evaluator_version(
+        ev_uuid,
+        judge_model="m",
+        system_prompt="Check {{criteria}}",
+        variables=[{"name": "criteria"}],
+    )
+
+    # Same name set → allowed (description/default may change).
+    v2 = db.create_evaluator_version(
+        ev_uuid,
+        judge_model="m",
+        system_prompt="Strictly check {{criteria}}",
+        variables=[{"name": "criteria", "description": "now with a description"}],
+    )
+    assert v2["version_number"] == 2
+
+    # Renamed variable → rejected.
+    with pytest.raises(ValueError, match="immutable"):
+        db.create_evaluator_version(
+            ev_uuid,
+            judge_model="m",
+            system_prompt="Check {{requirement}}",
+            variables=[{"name": "requirement"}],
+        )
+
+    # Added variable → rejected.
+    with pytest.raises(ValueError, match="immutable"):
+        db.create_evaluator_version(
+            ev_uuid,
+            judge_model="m",
+            system_prompt="Check {{criteria}} and {{extra}}",
+            variables=[{"name": "criteria"}, {"name": "extra"}],
+        )
+
+    # Removed all variables → rejected.
+    with pytest.raises(ValueError, match="immutable"):
+        db.create_evaluator_version(
+            ev_uuid, judge_model="m", system_prompt="Check it", variables=None
+        )
+
+
 def test_add_test_to_agent_restore_refreshes_created_at(user):
     """Re-adding a soft-deleted link reuses the row but refreshes created_at
     to now, so the re-added test sorts as recently-added rather than inheriting

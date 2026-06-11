@@ -4221,6 +4221,16 @@ def create_evaluator_version(
 
     `output_config` (the rubric — scale values/labels/descriptions/colors) is version-owned
     and validated against the parent evaluator's `output_type`.
+
+    Variables are IMMUTABLE across versions: a new version (2+) must declare the
+    exact same set of variable names (`{{placeholder}}`s) as the prior version,
+    else `ValueError`. This mirrors the frontend, which doesn't let you change an
+    evaluator's variables after creation. The invariant is load-bearing because
+    LLM tests resolve the LIVE evaluator version at run time while keeping each
+    test's pinned `variable_values` (see `get_evaluators_for_test`): if a later
+    version could rename/add/remove a variable, an existing test's frozen values
+    would no longer fill the live prompt's placeholders, silently sending a
+    half-rendered prompt to the judge. Freezing the variable set closes that gap.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -4238,6 +4248,33 @@ def create_evaluator_version(
             (evaluator_uuid,),
         )
         max_v = cursor.fetchone()["max_v"] or 0
+
+        # Variables are frozen after the first version. Compare the new version's
+        # variable names against the most recent existing version and reject a
+        # mismatch. Only names matter — they're the `{{placeholder}}` keys that
+        # pinned per-test `variable_values` fill; description/default are cosmetic
+        # and may change.
+        if max_v > 0:
+            cursor.execute(
+                "SELECT variables FROM evaluator_versions "
+                "WHERE evaluator_id = ? ORDER BY version_number DESC LIMIT 1",
+                (evaluator_uuid,),
+            )
+            prev_row = cursor.fetchone()
+            prev_vars = (
+                json.loads(prev_row["variables"])
+                if prev_row and prev_row["variables"]
+                else []
+            )
+            prev_names = {v.get("name") for v in prev_vars}
+            new_names = {v.get("name") for v in (variables or [])}
+            if prev_names != new_names:
+                raise ValueError(
+                    "Evaluator variables are immutable across versions: new "
+                    f"version variables {sorted(n for n in new_names if n)} do "
+                    f"not match existing {sorted(n for n in prev_names if n)}"
+                )
+
         version_number = max_v + 1
         version_uuid = str(uuid.uuid4())
         cursor.execute(
@@ -4557,7 +4594,24 @@ def remove_evaluator_from_test(test_id: str, evaluator_id: str) -> bool:
 
 
 def get_evaluators_for_test(test_id: str) -> List[Dict[str, Any]]:
-    """Return evaluator link rows joined with evaluator + version details for a single test."""
+    """Return evaluator link rows joined with evaluator + version details for a single test.
+
+    Version resolution is ALWAYS LIVE: the version columns (version_number,
+    judge_model, system_prompt, output_config, variables) come from the
+    evaluator's current ``live_version_id``, NOT the ``evaluator_version_id``
+    pinned on the pivot at link time. So a test run always picks up the latest
+    evaluator edits — unlike simulations/STT/TTS, which stay pinned to the
+    link-time version. The ``COALESCE`` only guards the degenerate case where the
+    evaluator somehow has no live version. The pivot's ``variable_values``
+    (per-test {{var}} substitutions) stay pinned — they're test config, not part
+    of the evaluator version.
+
+    The returned ``evaluator_version_id`` is the LIVE version's id (``ev.uuid``),
+    not the pinned ``te.evaluator_version_id`` — so the id, ``version_number``,
+    and rubric/prompt in each row all describe the SAME version (the one that
+    actually runs). The pivot column is still stored (FK NOT NULL) but no longer
+    surfaced, to avoid a row that labels live content with a stale version id.
+    """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -4572,7 +4626,7 @@ def get_evaluators_for_test(test_id: str) -> List[Dict[str, Any]]:
                 e.output_type AS output_type,
                 e.owner_user_id AS owner_user_id,
                 e.slug AS slug,
-                te.evaluator_version_id AS evaluator_version_id,
+                ev.uuid AS evaluator_version_id,
                 te.variable_values AS variable_values,
                 ev.version_number AS version_number,
                 ev.judge_model AS judge_model,
@@ -4581,7 +4635,8 @@ def get_evaluators_for_test(test_id: str) -> List[Dict[str, Any]]:
                 ev.variables AS variables
               FROM test_evaluators te
               JOIN evaluators e ON e.uuid = te.evaluator_id
-              JOIN evaluator_versions ev ON ev.uuid = te.evaluator_version_id
+              JOIN evaluator_versions ev
+                ON ev.uuid = COALESCE(e.live_version_id, te.evaluator_version_id)
              WHERE te.test_id = ? AND te.deleted_at IS NULL AND e.deleted_at IS NULL
              ORDER BY te.created_at ASC
             """,
