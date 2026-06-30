@@ -42,6 +42,11 @@ API documentation: http://localhost:8000/docs
 
 ## Contributing
 
+Related repositories:
+
+- [Calibrate frontend](https://github.com/ARTPARK-SAHAI-ORG/calibrate-frontend)
+- [Calibrate CLI](https://github.com/ARTPARK-SAHAI-ORG/calibrate)
+
 After cloning the repo, enable the project's git hooks so the pre-commit test
 runner fires on commits to `main`:
 
