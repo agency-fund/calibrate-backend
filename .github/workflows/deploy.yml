@@ -32,8 +32,7 @@ jobs:
               --exclude-drafts \
               --limit 100 \
               --json tagName,publishedAt \
-              --jq 'sort_by(.publishedAt) | reverse | .[] | select(.tagName != env.CURRENT_TAG and .publishedAt < env.CURRENT_PUBLISHED_AT) | .tagName' \
-              | head -n 1
+              --jq 'sort_by(.publishedAt) | reverse | first(select(.tagName != env.CURRENT_TAG and .publishedAt < env.CURRENT_PUBLISHED_AT)) | .tagName // empty'
           )"
 
           if [ -z "$previous_tag" ]; then
