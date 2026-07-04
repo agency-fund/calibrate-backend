@@ -1,0 +1,33 @@
+name: Validate SDK config
+
+# Runs `fern check` on PRs that touch the Fern SDK config, so a broken
+# generators.yml / openapi-overrides.yml is caught here instead of only when an
+# `sdk-v*` release tag is pushed (where it would fail the publish). Fetches the
+# public spec via ./.github/actions/fetch-public-spec (same as publish-sdk.yml),
+# then validates — it does not generate or publish anything.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "fern/**"
+      - ".github/actions/fetch-public-spec/**"
+      - ".github/workflows/validate-sdk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fern-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install deps, boot the app, and fetch its public spec into fern/openapi/.
+      - uses: ./.github/actions/fetch-public-spec
+
+      - name: Install Fern
+        run: npm install -g fern-api
+
+      - name: Validate Fern config
+        run: fern check

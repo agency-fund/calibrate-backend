@@ -16,3 +16,7 @@ db
 notebooks
 .specstory
 .claude
+
+# Public OpenAPI spec fetched from the running app for SDK generation; never
+# committed (the publish workflow curls it fresh from /public-api/openapi.json).
+fern/openapi/
