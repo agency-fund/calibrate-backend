@@ -26,7 +26,7 @@ Calibrate Backend is a FastAPI REST API that wraps the `calibrate` CLI tool to o
 2. **LLM agent testing** — unit tests and multi-model benchmarks
 3. **Voice/chat simulations** — simulated conversations between AI agents and personas across scenarios
 
-The backend persists state in SQLite, stores artifacts in S3-compatible object storage (or local disk when `OBJECT_STORAGE_MODE=local` for development), and spawns `calibrate` CLI subprocesses to do the actual work. Authentication is Google OAuth or email/password, gated by JWTs.
+The backend persists state in SQLite, stores artifacts in S3-compatible object storage (or local disk when `OBJECT_STORAGE_MODE=local` for development), and spawns `calibrate-agent` CLI subprocesses (PyPI package `calibrate-agent`, console script `calibrate-agent`) to do the actual work. Authentication is Google OAuth or email/password, gated by JWTs.
 
 ## Required Reading
 
