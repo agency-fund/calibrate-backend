@@ -50,10 +50,26 @@ jobs:
         env:
           PUBLIC_API_BASE_URL: ${{ secrets.PUBLIC_API_BASE_URL }}
 
+      - name: Stage CI helper scripts
+        run: |
+          stage_file() {
+            local path="$1" dest="$2"
+            if [ -f "$path" ]; then
+              cp "$path" "$dest"
+            else
+              git fetch origin main --depth=1
+              git show "origin/main:${path}" > "$dest"
+            fi
+          }
+          stage_file .github/scripts/fetch-public-openapi.sh /tmp/fetch-public-openapi.sh
+          stage_file .github/scripts/normalize_openapi_hash.py /tmp/normalize_openapi_hash.py
+          stage_file .github/scripts/next_sdk_version.py /tmp/next_sdk_version.py
+          chmod +x /tmp/fetch-public-openapi.sh
+
       - name: Compute current release spec hash
         id: head_hash
         run: |
-          HASH=$(python3 .github/scripts/normalize_openapi_hash.py openapi/openapi.json)
+          HASH=$(python3 /tmp/normalize_openapi_hash.py openapi/openapi.json)
           echo "hash=$HASH" >> "$GITHUB_OUTPUT"
 
       - name: Compute previous release spec hash
@@ -61,8 +77,6 @@ jobs:
         env:
           PUBLIC_API_BASE_URL: ${{ secrets.PUBLIC_API_BASE_URL }}
         run: |
-          chmod +x .github/scripts/fetch-public-openapi.sh
-
           if ! git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
             echo "missing_parent=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -70,8 +84,8 @@ jobs:
 
           git checkout --quiet HEAD~1
           uv sync --frozen
-          ./.github/scripts/fetch-public-openapi.sh openapi/openapi-parent.json
-          HASH=$(python3 .github/scripts/normalize_openapi_hash.py openapi/openapi-parent.json)
+          /tmp/fetch-public-openapi.sh openapi/openapi-parent.json
+          HASH=$(python3 /tmp/normalize_openapi_hash.py openapi/openapi-parent.json)
           echo "hash=$HASH" >> "$GITHUB_OUTPUT"
           echo "missing_parent=false" >> "$GITHUB_OUTPUT"
 
@@ -85,8 +99,6 @@ jobs:
           PARENT_HASH: ${{ steps.parent_hash_done.outputs.hash }}
           MISSING_PARENT: ${{ steps.parent_hash_done.outputs.missing_parent }}
         run: |
-          chmod +x .github/scripts/next-sdk-version.sh
-
           if [ "$FORCE" = "true" ]; then
             CHANGED=true
           elif [ "$MISSING_PARENT" = "true" ]; then
@@ -106,7 +118,7 @@ jobs:
           if [ -n "$INPUT_VERSION" ]; then
             VERSION="$INPUT_VERSION"
           else
-            VERSION="$(.github/scripts/next-sdk-version.sh)"
+            VERSION="$(python3 /tmp/next_sdk_version.py)"
           fi
 
           echo "should_publish=true" >> "$GITHUB_OUTPUT"

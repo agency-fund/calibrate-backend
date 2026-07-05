@@ -3,7 +3,7 @@
 set -euo pipefail
 
 OUT="${1:-openapi/openapi.json}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT="${GITHUB_WORKSPACE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "${ROOT}"
 
 pkill -f "uvicorn main:app" 2>/dev/null || true
