@@ -17,6 +17,15 @@ notebooks
 .specstory
 .claude
 
-# Public OpenAPI spec fetched from the running app for SDK generation; never
+# Public OpenAPI spec fetched from the running app for client generation; never
 # committed (the publish workflow curls it fresh from /public-api/openapi.json).
+openapi/openapi.json
+openapi/compiled.yaml
 fern/openapi/
+
+# Speakeasy generated CLI tree (gen.yaml under .speakeasy/ is committed).
+.speakeasy/out/cli/*
+!.speakeasy/out/cli/.speakeasy/
+.speakeasy/logs/
+.speakeasy/workflow.lock
+.speakeasy/out/python/

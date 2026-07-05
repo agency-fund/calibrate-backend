@@ -150,8 +150,9 @@ def custom_openapi(_: HTTPBasicCredentials = Depends(_verify_docs_access)):
 # Basic-Auth'd /docs above. The schema is filtered from the full app schema,
 # so it stays in sync automatically as routes change.
 PUBLIC_API_TAG = "Public API"
-# Name of the apiKey security scheme published on the public spec. Fern derives
-# the SDK's required `api_key` auth param from this being the sole scheme.
+# Name of the apiKey security scheme published on the public spec. Fern (Python SDK)
+# and Speakeasy (CLI) both derive the required api_key auth param from this being
+# the sole scheme.
 PUBLIC_API_KEY_SCHEME = "ApiKeyAuth"
 
 
@@ -186,7 +187,7 @@ def _build_public_openapi() -> Dict[str, Any]:
             #
             # Force the API-key scheme as the SOLE auth on every public op. The
             # underlying dep (`get_org_jwt_or_api_key`) also accepts a JWT bearer,
-            # but FastAPI's auto-generated `HTTPBearer` scheme would make Fern emit
+            # but FastAPI's auto-generated `HTTPBearer` scheme would make Fern/Speakeasy emit
             # a REQUIRED `token` constructor arg in the SDK (with `api_key`
             # optional) — so `Calibrate(api_key=…)` would TypeError. Pinning
             # `PUBLIC_API_KEY_SCHEME` here makes `api_key` the one required auth
@@ -231,7 +232,7 @@ def _build_public_openapi() -> Dict[str, Any]:
             "type": "apiKey",
             "in": "header",
             "name": "X-API-Key",
-            "description": "Org-scoped API key. Create one under Settings → API keys.",
+            "description": "Workspace API key. Create one under Workspace settings → API keys.",
         }
     }
 
@@ -267,6 +268,7 @@ def public_swagger_ui():
     return get_swagger_ui_html(
         openapi_url="/public-api/openapi.json", title="Calibrate Public API"
     )
+
 
 # Include routers
 app.include_router(auth_router)
