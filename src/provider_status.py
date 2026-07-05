@@ -14,6 +14,12 @@ from utils import get_calibrate_agent_cli
 logger = logging.getLogger(__name__)
 
 
+def _without_groq(providers: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        name: info for name, info in providers.items() if name.lower() != "groq"
+    }
+
+
 def _utc_now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
@@ -184,12 +190,14 @@ class ProviderStatusMonitor:
             )
 
         try:
-            return parse_provider_status_stdout(stdout)
+            providers = _without_groq(parse_provider_status_stdout(stdout))
         except ValueError as exc:
             raise HTTPException(
                 status_code=500,
                 detail=str(exc),
             )
+
+        return providers
 
     async def refresh_cache(self) -> None:
         logger.info("Provider status refresh started")
@@ -231,10 +239,12 @@ class ProviderStatusMonitor:
     def clear_cache(self) -> None:
         self._cache = None
 
-    async def response(self) -> JSONResponse:
+    async def response(self, *, force_refresh: bool = False) -> JSONResponse:
+        if force_refresh:
+            await self.refresh_cache()
         async with self._cache_lock:
             cache_entry = self._cache
-        return self._response_from_cache(cache_entry)
+        return self._response_from_cache(cache_entry, force_refresh=force_refresh)
 
     def _cache_age_seconds(self, cache_entry: Dict[str, Any]) -> float:
         checked_at = cache_entry.get("checked_at")
@@ -246,6 +256,8 @@ class ProviderStatusMonitor:
     def _response_from_cache(
         self,
         cache_entry: Optional[Dict[str, Any]],
+        *,
+        force_refresh: bool = False,
     ) -> JSONResponse:
         if cache_entry is None:
             return JSONResponse(
@@ -254,17 +266,20 @@ class ProviderStatusMonitor:
                     "success": False,
                     "cached": False,
                     "message": "Provider status has not been checked yet",
+                    **({"refreshed": True} if force_refresh else {}),
                 },
             )
 
         age_seconds = self._cache_age_seconds(cache_entry)
         is_stale = age_seconds > self.cache_max_age_seconds
-        base_payload = {
+        base_payload: Dict[str, Any] = {
             "cached": True,
             "checked_at": cache_entry["checked_at"],
             "age_seconds": round(age_seconds, 3),
             "stale": is_stale,
         }
+        if force_refresh:
+            base_payload["refreshed"] = True
 
         if cache_entry.get("error_detail") is not None:
             return JSONResponse(
