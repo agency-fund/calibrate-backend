@@ -44,7 +44,7 @@ jobs:
 
   prepare:
     needs: gate
-    if: needs.gate.outputs.publish_enabled == 'true'
+    if: needs.gate.outputs.publish_enabled == 'yes'
     runs-on: ubuntu-latest
     environment: Production
     outputs:

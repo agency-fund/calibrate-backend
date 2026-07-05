@@ -30,8 +30,29 @@ runs:
         PUSH_TO_REPO_TOKEN: ${{ inputs.push_to_repo_token }}
       run: |
         # Enabled as long as both secrets are set (non-empty).
-        if [ -n "$SDK_AUTO_PUBLISH_ENABLED" ] && [ -n "$PUSH_TO_REPO_TOKEN" ]; then
-          echo "publish_enabled=true" >> "$GITHUB_OUTPUT"
+        # Never print secret values — only whether each is set, plus lengths.
+        #
+        # IMPORTANT: the output value must NOT collide with a secret value.
+        # If SDK_AUTO_PUBLISH_ENABLED's value is the string "true", GitHub masks
+        # it everywhere and will "Skip output '...' since it may contain secret",
+        # leaving the output empty. So we emit "yes"/"no" (see consumers' if:).
+        if [ -n "$SDK_AUTO_PUBLISH_ENABLED" ]; then sdk_set=yes; else sdk_set=no; fi
+        if [ -n "$PUSH_TO_REPO_TOKEN" ]; then tok_set=yes; else tok_set=no; fi
+
+        echo "::group::Publish gate evaluation"
+        echo "SDK_AUTO_PUBLISH_ENABLED set: $sdk_set (length ${#SDK_AUTO_PUBLISH_ENABLED})"
+        echo "PUSH_TO_REPO_TOKEN set:      $tok_set (length ${#PUSH_TO_REPO_TOKEN})"
+
+        if [ "$sdk_set" = yes ] && [ "$tok_set" = yes ]; then
+          echo "Decision: publish_enabled=yes (both secrets present)"
+          echo "::endgroup::"
+          echo "publish_enabled=yes" >> "$GITHUB_OUTPUT"
         else
-          echo "publish_enabled=false" >> "$GITHUB_OUTPUT"
+          reason="publish blocked:"
+          [ "$sdk_set" = no ] && reason="$reason SDK_AUTO_PUBLISH_ENABLED is empty/unset (check the Production environment secret);"
+          [ "$tok_set" = no ] && reason="$reason PUSH_TO_REPO_TOKEN is empty/unset (check the Production environment secret);"
+          echo "Decision: publish_enabled=no"
+          echo "::endgroup::"
+          echo "::warning::$reason"
+          echo "publish_enabled=no" >> "$GITHUB_OUTPUT"
         fi
