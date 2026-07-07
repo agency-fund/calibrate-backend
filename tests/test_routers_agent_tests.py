@@ -491,6 +491,47 @@ def test_agent_tests_poisoned_link_does_not_leak_through_run_or_benchmark(
     assert "no tests linked" in benchmark_resp.json()["detail"].lower()
 
 
+def test_queue_starters_ignore_cross_org_test_snapshot():
+    """_start_llm_unit_test_job_from_queue / _start_llm_benchmark_job_from_queue
+    re-fetch tests from a job's `details.test_uuids` snapshot, which could
+    predate a fix to whatever wrote it (e.g. a job queued before this PR
+    shipped). Both must refuse to start with a cross-org test in the snapshot,
+    same as if no tests were linked at all."""
+    from routers.agent_tests import (
+        _start_llm_benchmark_job_from_queue,
+        _start_llm_unit_test_job_from_queue,
+    )
+
+    agent = {"uuid": "a", "org_uuid": "org-a"}
+    foreign_test = {"uuid": "t", "org_uuid": "org-b"}
+
+    with patch("routers.agent_tests.get_agent", return_value=agent), patch(
+        "routers.agent_tests.get_test", return_value=foreign_test
+    ), patch("routers.agent_tests.threading.Thread") as thread_mock:
+        started = _start_llm_unit_test_job_from_queue(
+            {"uuid": "j-1", "details": {"agent_uuid": "a", "test_uuids": ["t"], "s3_bucket": "b"}}
+        )
+    assert started is False
+    thread_mock.assert_not_called()
+
+    with patch("routers.agent_tests.get_agent", return_value=agent), patch(
+        "routers.agent_tests.get_test", return_value=foreign_test
+    ), patch("routers.agent_tests.threading.Thread") as thread_mock:
+        started = _start_llm_benchmark_job_from_queue(
+            {
+                "uuid": "j-2",
+                "details": {
+                    "agent_uuid": "a",
+                    "test_uuids": ["t"],
+                    "models": ["m"],
+                    "s3_bucket": "b",
+                },
+            }
+        )
+    assert started is False
+    thread_mock.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Run + benchmark validations (queue path, no thread)
 # ---------------------------------------------------------------------------

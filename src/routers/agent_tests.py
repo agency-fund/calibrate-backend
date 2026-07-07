@@ -27,6 +27,7 @@ from db import (
     get_agent,
     get_all_agents,
     get_test,
+    get_all_tests,
     get_tools_for_agent,
     get_evaluators_for_test,
     get_evaluator_by_slug,
@@ -78,10 +79,13 @@ def _start_llm_unit_test_job_from_queue(job: dict) -> bool:
     if not agent:
         return False
 
+    # Re-check org on every test in the snapshot rather than trusting it as-is
+    # (see the matching comment in run_agent_test) — the snapshot was written
+    # at queue time and could predate a fix to whatever created it.
     tests = []
     for test_uuid in test_uuids:
         test = get_test(test_uuid)
-        if test:
+        if test and test.get("org_uuid") == agent.get("org_uuid"):
             tests.append(test)
 
     if not tests:
@@ -113,10 +117,13 @@ def _start_llm_benchmark_job_from_queue(job: dict) -> bool:
     if not agent:
         return False
 
+    # Re-check org on every test in the snapshot rather than trusting it as-is
+    # (see the matching comment in run_agent_test) — the snapshot was written
+    # at queue time and could predate a fix to whatever created it.
     tests = []
     for test_uuid in test_uuids:
         test = get_test(test_uuid)
-        if test:
+        if test and test.get("org_uuid") == agent.get("org_uuid"):
             tests.append(test)
 
     if not tests or not models:
@@ -558,9 +565,16 @@ async def create_agent_test_links(
 )
 async def list_agent_tests(ctx: OrgContext = Depends(get_current_org)):
     """List all agent-test links in your workspace."""
+    # Filter by BOTH sides of the link, not just the agent — a stale or
+    # future-poisoned row could link one of your own agents to a foreign
+    # test, and that test_id shouldn't leak here either.
     org_agent_uuids = {a["uuid"] for a in get_all_agents(org_uuid=ctx.org_uuid)}
+    org_test_uuids = {t["uuid"] for t in get_all_tests(org_uuid=ctx.org_uuid)}
     links = [
-        link for link in get_all_agent_tests() if link.get("agent_id") in org_agent_uuids
+        link
+        for link in get_all_agent_tests()
+        if link.get("agent_id") in org_agent_uuids
+        and link.get("test_id") in org_test_uuids
     ]
     return links
 
