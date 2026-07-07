@@ -1,6 +1,6 @@
 from typing import List, Dict, Any, Literal
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Depends, Path
+from pydantic import BaseModel, Field
 from sqlite3 import IntegrityError
 
 from auth_utils import get_current_org, OrgContext
@@ -18,45 +18,93 @@ from db import (
 
 router = APIRouter(prefix="/agent-tools", tags=["agent-tools"])
 
+_EXAMPLE_ID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+
 
 class AgentToolsCreate(BaseModel):
-    agent_uuid: str
-    tool_uuids: List[str]
+    agent_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="The agent to link tools to. Must be in your workspace.",
+        examples=[_EXAMPLE_ID],
+    )
+    tool_uuids: List[str] = Field(
+        description="Tools to link. Already-linked tools are skipped",
+        examples=[[_EXAMPLE_ID, "6ba7b810-9dad-11d1-80b4-00c04fd430c8"]],
+    )
 
 
 class AgentToolDelete(BaseModel):
-    agent_uuid: str
-    tool_uuid: str
+    agent_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="The agent to unlink a tool from. Must be in your workspace.",
+        examples=[_EXAMPLE_ID],
+    )
+    tool_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="The tool to unlink from the agent",
+        examples=[_EXAMPLE_ID],
+    )
 
 
 class AgentToolResponse(BaseModel):
-    id: int
-    agent_id: str
-    tool_id: str
-    created_at: str
+    id: int = Field(description="Auto-increment link row ID")
+    agent_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Linked agent ID",
+        examples=[_EXAMPLE_ID],
+    )
+    tool_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Linked tool ID",
+        examples=[_EXAMPLE_ID],
+    )
+    created_at: str = Field(description="When the link was created (ISO 8601 UTC)")
 
 
 class AgentToolsCreateResponse(BaseModel):
-    ids: List[int]
-    message: str
+    ids: List[int] = Field(
+        description="Link row IDs created this call (excludes tools that were already linked)"
+    )
+    message: str = Field(description="Human-readable confirmation message")
 
 
 class ToolResponse(BaseModel):
-    uuid: str
-    name: str
-    description: str
-    config: Dict[str, Any] | None = None
-    created_at: str
-    updated_at: str
+    uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="ID of the tool",
+        examples=[_EXAMPLE_ID],
+    )
+    name: str = Field(description="Human-readable tool name")
+    description: str = Field(description="What the tool does")
+    config: Dict[str, Any] | None = Field(
+        None, description="Tool configuration; null when the tool has none"
+    )
+    created_at: str = Field(description="When the tool was created (ISO 8601 UTC)")
+    updated_at: str = Field(description="When the tool was last updated (ISO 8601 UTC)")
 
 
 class AgentResponse(BaseModel):
-    uuid: str
-    name: str
-    type: Literal["agent", "connection"]
-    config: Dict[str, Any] | None = None
-    created_at: str
-    updated_at: str
+    uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="ID of the agent",
+        examples=[_EXAMPLE_ID],
+    )
+    name: str = Field(description="Human-readable agent name")
+    type: Literal["agent", "connection"] = Field(
+        description="`agent` applies managed defaults; `connection` stores the config you supply as-is"
+    )
+    config: Dict[str, Any] | None = Field(
+        None, description="Behavioral config; null when the agent has none"
+    )
+    created_at: str = Field(description="When the agent was created (ISO 8601 UTC)")
+    updated_at: str = Field(description="When the agent was last updated (ISO 8601 UTC)")
 
 
 def _require_owned_agent(agent_uuid: str, org_uuid: str) -> Dict[str, Any]:
@@ -73,13 +121,14 @@ def _require_owned_tool(tool_uuid: str, org_uuid: str) -> Dict[str, Any]:
     return tool
 
 
-@router.post("", response_model=AgentToolsCreateResponse)
+@router.post(
+    "", response_model=AgentToolsCreateResponse, summary="Link tools to agent"
+)
 async def create_agent_tool_links(
     agent_tools: AgentToolsCreate,
     ctx: OrgContext = Depends(get_current_org),
 ):
-    """Link tools to an agent. The agent AND every tool must belong to the
-    caller's org — cross-org linking is rejected as 404."""
+    """Link one or more tools to an agent. Already-linked tools are skipped."""
     _require_owned_agent(agent_tools.agent_uuid, ctx.org_uuid)
     for tool_uuid in agent_tools.tool_uuids:
         _require_owned_tool(tool_uuid, ctx.org_uuid)
@@ -103,35 +152,53 @@ async def create_agent_tool_links(
     )
 
 
-@router.get("", response_model=List[AgentToolResponse])
+@router.get(
+    "", response_model=List[AgentToolResponse], summary="List agent-tool links"
+)
 async def list_agent_tools(ctx: OrgContext = Depends(get_current_org)):
-    """List agent-tool links scoped to the caller's org."""
+    """List all agent-tool links in your workspace."""
     return get_all_agent_tools(org_uuid=ctx.org_uuid)
 
 
-@router.get("/agent/{agent_uuid}/tools", response_model=List[ToolResponse])
+@router.get(
+    "/agent/{agent_uuid}/tools",
+    response_model=List[ToolResponse],
+    summary="List tools for agent",
+)
 async def get_agent_tools(
-    agent_uuid: str, ctx: OrgContext = Depends(get_current_org)
+    agent_uuid: str = Path(
+        description="The agent whose linked tools to list. Must be in your workspace.",
+        examples=[_EXAMPLE_ID],
+    ),
+    ctx: OrgContext = Depends(get_current_org),
 ):
+    """List the tools linked to an agent."""
     _require_owned_agent(agent_uuid, ctx.org_uuid)
     return get_tools_for_agent(agent_uuid)
 
 
-@router.get("/tool/{tool_uuid}/agents", response_model=List[AgentResponse])
+@router.get(
+    "/tool/{tool_uuid}/agents",
+    response_model=List[AgentResponse],
+    summary="List agents for tool",
+)
 async def get_tool_agents(
-    tool_uuid: str, ctx: OrgContext = Depends(get_current_org)
+    tool_uuid: str = Path(
+        description="The tool whose linked agents to list. Must be in your workspace.",
+        examples=[_EXAMPLE_ID],
+    ),
+    ctx: OrgContext = Depends(get_current_org),
 ):
+    """List the agents a tool is linked to."""
     _require_owned_tool(tool_uuid, ctx.org_uuid)
     return get_agents_for_tool(tool_uuid)
 
 
-@router.delete("")
+@router.delete("", summary="Unlink tool from agent")
 async def delete_agent_tool_link(
     agent_tool: AgentToolDelete, ctx: OrgContext = Depends(get_current_org)
 ):
-    """Unlink a tool from an agent. Requires the agent to be in the caller's
-    org — the tool's org doesn't matter on delete (the link being torn down
-    was created by someone who already had access)."""
+    """Unlink a tool from an agent."""
     _require_owned_agent(agent_tool.agent_uuid, ctx.org_uuid)
     deleted = remove_tool_from_agent(agent_tool.agent_uuid, agent_tool.tool_uuid)
     if not deleted:

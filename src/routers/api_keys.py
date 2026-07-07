@@ -1,17 +1,13 @@
-"""API keys router — credentials for programmatic API access.
+"""API keys for programmatic access to your workspace.
 
-A key is scoped to the caller's active org (resolved via `get_current_org`, i.e.
-the `X-Org-UUID` header or the personal org). The raw `sk_…` key is returned
-exactly once, on creation; afterwards only its prefix and bcrypt hash are stored,
-so it can be listed/revoked but never re-displayed. Authenticate downstream
-requests with `Authorization: Bearer sk_…` or `X-API-Key: sk_…` — see
-`auth_utils.get_org_jwt_or_api_key`.
+Each key is scoped to your active workspace. The raw key is returned exactly
+once at creation; later reads show only a masked display form.
 """
 
 import re
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Path
 from pydantic import BaseModel, Field, field_validator
 
 from auth_utils import (
@@ -32,11 +28,16 @@ router = APIRouter(prefix="/api-keys", tags=["api-keys"])
 
 
 class CreateApiKeyRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Human-readable label shown in your key listings",
+    )
 
 
 def _masked(last_four: str) -> str:
-    """Display form once the raw key is gone, e.g. `sk_••••1a2b`."""
+    """Display form once the raw key is gone, e.g. `••••1a2b`."""
     return f"{API_KEY_PREFIX}••••{last_four}"
 
 
@@ -59,19 +60,24 @@ def _to_utc_iso(ts: Optional[str]) -> Optional[str]:
 
 
 class ApiKeyResponse(BaseModel):
-    """Listing shape — never includes the raw key.
-
-    `last_four` is the only fragment of the key kept after creation;
-    `masked_key` is a ready-to-render display string built from it.
-    """
-
-    uuid: str
-    name: str
-    last_four: str
-    masked_key: str
-    last_used_at: Optional[str] = None
-    created_at: str
-    updated_at: str
+    uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="API key ID",
+    )
+    name: str = Field(description="Human-readable label for the key")
+    last_four: str = Field(
+        description="Last four characters of the key — the only fragment kept after creation"
+    )
+    masked_key: str = Field(
+        description="Masked display form of the key for listings"
+    )
+    last_used_at: Optional[str] = Field(
+        None,
+        description="When the key last authenticated a request; `null` if never used",
+    )
+    created_at: str = Field(description="When the key was created (ISO 8601 UTC)")
+    updated_at: str = Field(description="When the key was last updated (ISO 8601 UTC)")
 
     # Stamp timestamps as explicit UTC (…Z) so the FE doesn't read them as local.
     @field_validator("created_at", "updated_at", "last_used_at")
@@ -88,18 +94,19 @@ class ApiKeyResponse(BaseModel):
 
 
 class CreateApiKeyResponse(ApiKeyResponse):
-    """Creation shape — carries the raw `key` exactly once. Show it, then never
-    again; subsequent reads only ever return `masked_key` / `last_four`."""
+    key: str = Field(
+        description="The API key. **Returned exactly once at creation** — store it now; it cannot be retrieved again"
+    )
 
-    key: str
 
-
-@router.post("", response_model=CreateApiKeyResponse, status_code=201)
+@router.post(
+    "", response_model=CreateApiKeyResponse, status_code=201, summary="Create API key"
+)
 async def create_key(
     request: CreateApiKeyRequest,
     ctx: OrgContext = Depends(get_current_org),
 ):
-    """Mint a new API key for the caller's active org. Returns the raw key once."""
+    """Create an API key for your workspace."""
     raw_key, key_prefix = generate_api_key()
     row = create_api_key(
         org_uuid=ctx.org_uuid,
@@ -112,18 +119,21 @@ async def create_key(
     return CreateApiKeyResponse.from_row(row, key=raw_key)
 
 
-@router.get("", response_model=List[ApiKeyResponse])
+@router.get("", response_model=List[ApiKeyResponse], summary="List API keys")
 async def list_keys(ctx: OrgContext = Depends(get_current_org)):
-    """List active API keys for the caller's active org (no raw keys)."""
+    """List active API keys in your workspace."""
     return [ApiKeyResponse.from_row(k) for k in list_api_keys_for_org(ctx.org_uuid)]
 
 
-@router.delete("/{key_uuid}", status_code=204)
+@router.delete("/{key_uuid}", status_code=204, summary="Revoke API key")
 async def revoke_key(
-    key_uuid: str,
+    key_uuid: str = Path(
+        description="The API key to revoke. Must be in your workspace.",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
     ctx: OrgContext = Depends(get_current_org),
 ):
-    """Revoke (soft-delete) an API key. 404 if it isn't in the caller's org."""
+    """Revoke an API key in your workspace."""
     if get_api_key(key_uuid, ctx.org_uuid) is None:
         raise HTTPException(status_code=404, detail="API key not found")
     soft_delete_api_key(key_uuid, ctx.org_uuid)

@@ -16,7 +16,7 @@ import boto3
 from botocore.config import Config
 import openpyxl
 import sentry_sdk
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -137,14 +137,23 @@ class EvaluatorRunEntry(BaseModel):
     release).
     """
 
-    evaluator_uuid: str
+    evaluator_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="ID of the evaluator",
+    )
     metric_key: (
         str  # key as emitted in metrics.json (derived from CLI/config at run time)
     )
     aggregate: Dict[str, Any]
     name: Optional[str] = None  # filled on API read from DB + job snapshot
     description: Optional[str] = None  # filled on API read from current DB row
-    evaluator_version_id: Optional[str] = None  # pinned at job-submit time
+    evaluator_version_id: Optional[str] = Field(
+        None,
+        min_length=36,
+        max_length=36,
+        description="Pinned evaluator version ID at job-submit time",
+    )
     output_type: Optional[str] = None  # "binary" | "rating" — drives per-row typing
 
 
@@ -159,17 +168,41 @@ class ProviderResult(BaseModel):
 
 
 class TaskCreateResponse(BaseModel):
-    task_id: str
-    status: str
-    dataset_id: Optional[str] = None
-    dataset_name: Optional[str] = None
+    task_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Unique identifier for this evaluation job",
+        examples=["a3b2c1d0-e5f4-3210-abcd-ef1234567890"],
+    )
+    status: str = Field(
+        description="Current status of the evaluation job: `queued` or `in_progress`"
+    )
+    dataset_id: Optional[str] = Field(
+        None,
+        min_length=36,
+        max_length=36,
+        description="ID of the dataset being evaluated",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    )
+    dataset_name: Optional[str] = Field(
+        None, description="Name of the dataset being evaluated"
+    )
 
 
 class TaskStatusResponse(BaseModel):
-    task_id: str
+    task_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Evaluation job ID",
+    )
     status: str
     language: Optional[str] = None
-    dataset_id: Optional[str] = None
+    dataset_id: Optional[str] = Field(
+        None,
+        min_length=36,
+        max_length=36,
+        description="Source dataset ID",
+    )
     dataset_name: Optional[str] = None
     provider_results: Optional[List[ProviderResult]] = None
     leaderboard_summary: Optional[List[Dict[str, Any]]] = None

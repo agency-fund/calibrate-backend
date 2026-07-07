@@ -10,8 +10,8 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, HTTPException, Depends, Path as PathParam
+from pydantic import BaseModel, ConfigDict, Field
 
 from db import (
     create_job,
@@ -90,6 +90,8 @@ register_job_starter("tts-eval", _start_tts_job_from_queue)
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tts", tags=["tts"])
+
+_EXAMPLE_ID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 
 
 def _collect_tts_intermediate_results(
@@ -175,21 +177,29 @@ def _collect_tts_intermediate_results(
 class TTSEvaluationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # Option 1: reuse an existing dataset
-    dataset_id: Optional[str] = None
-    # Option 2: inline texts (legacy / new inputs)
-    texts: Optional[List[str]] = None  # List of texts to synthesize
-    # When providing inline data, name for the new dataset to save (ignored when dataset_id is set)
-    dataset_name: Optional[str] = None
-    providers: List[
-        str
-    ]  # List of TTS providers (e.g., ["smallest", "cartesia", "openai"])
-    language: str  # Language (e.g., "english", "hindi")
-    # Optional list of evaluator UUIDs to score this run. If omitted, the seeded TTS default
-    # evaluator is used. Each evaluator must have `evaluator_type == "tts"` (validated at
-    # submission time). At submission each UUID is hydrated against its then-live version
-    # and pinned into job details.
-    evaluator_uuids: Optional[List[str]] = None
+    dataset_id: Optional[str] = Field(
+        None,
+        min_length=36,
+        max_length=36,
+        description="Existing TTS dataset to evaluate. Must be in your workspace. **Provide this OR inline `texts`, not both**",
+        examples=[_EXAMPLE_ID],
+    )
+    texts: Optional[List[str]] = Field(
+        None,
+        description="Texts to synthesize, one per item. **Required when `dataset_id` is omitted**",
+    )
+    dataset_name: Optional[str] = Field(
+        None,
+        description="Name for a new dataset saved from inline inputs. Ignored when `dataset_id` is set; omit to skip saving",
+    )
+    providers: List[str] = Field(
+        description='TTS providers to compare, e.g. `["smallest", "cartesia", "openai"]`. At least one required'
+    )
+    language: str = Field(description='Language to synthesize in, e.g. `"english"` or `"hindi"`')
+    evaluator_uuids: Optional[List[str]] = Field(
+        None,
+        description="Evaluators to score synthesized audio; each must be a `tts` evaluator in your workspace. Omit to use the default TTS evaluator",
+    )
 
 
 def _resolve_evaluators_for_tts_job(
@@ -670,15 +680,11 @@ def run_tts_evaluation_task(
         try_start_queued_job(EVAL_JOB_TYPES)
 
 
-@router.post("/evaluate", response_model=TaskCreateResponse)
+@router.post("/evaluate", response_model=TaskCreateResponse, summary="Run TTS evaluation")
 async def evaluate_tts(
     request: TTSEvaluationRequest, ctx: OrgContext = Depends(get_current_org)
 ):
-    """
-    Start a background task to evaluate multiple TTS providers with text inputs.
-
-    Returns a task ID that can be used to poll for status and results.
-    """
+    """Benchmark TTS providers against text inputs as a background job."""
     if not request.providers:
         raise HTTPException(
             status_code=400,
@@ -755,21 +761,33 @@ async def evaluate_tts(
 
 
 class VisibilityRequest(BaseModel):
-    is_public: bool
+    is_public: bool = Field(
+        description="`true` to make the job publicly shareable; `false` to make it private"
+    )
 
 
 class VisibilityResponse(BaseModel):
-    is_public: bool
-    share_token: str | None = None
+    is_public: bool = Field(description="Whether the job is now publicly shareable")
+    share_token: str | None = Field(
+        None,
+        description="Opaque token for the public share URL when `is_public` is true; null when private",
+    )
 
 
-@router.patch("/evaluate/{task_id}/visibility", response_model=VisibilityResponse)
+@router.patch(
+    "/evaluate/{task_id}/visibility",
+    response_model=VisibilityResponse,
+    summary="Update TTS evaluation visibility",
+)
 async def update_tts_visibility(
-    task_id: str,
     body: VisibilityRequest,
+    task_id: str = PathParam(
+        description="The TTS evaluation to update. Must be in your workspace.",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
     ctx: OrgContext = Depends(get_current_org),
 ):
-    """Toggle public sharing for a TTS evaluation job."""
+    """Update public sharing for a TTS evaluation."""
     job = get_job(task_id, org_uuid=ctx.org_uuid)
     if not job or job.get("type") != "tts-eval":
         raise HTTPException(status_code=404, detail="Task not found")
@@ -783,15 +801,19 @@ async def update_tts_visibility(
     )
 
 
-@router.get("/evaluate/{task_id}", response_model=TaskStatusResponse)
+@router.get(
+    "/evaluate/{task_id}",
+    response_model=TaskStatusResponse,
+    summary="Get TTS evaluation status",
+)
 async def get_tts_evaluation_status(
-    task_id: str, ctx: OrgContext = Depends(get_current_org)
+    task_id: str = PathParam(
+        description="The TTS evaluation to poll. Must be in your workspace.",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
+    ctx: OrgContext = Depends(get_current_org),
 ):
-    """
-    Get the status of a TTS evaluation task.
-
-    Returns the current status and, if done, the provider results and leaderboard path.
-    """
+    """Get the status and results of a TTS evaluation."""
     job = get_job(task_id, org_uuid=ctx.org_uuid)
     if not job:
         raise HTTPException(status_code=404, detail="Task not found")

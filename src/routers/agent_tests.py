@@ -11,8 +11,8 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Depends, Path as PathParam, Query
+from pydantic import BaseModel, Field
 from sqlite3 import IntegrityError
 
 from db import (
@@ -138,227 +138,379 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent-tests", tags=["agent-tests"])
 
+# Doc-only examples — IDs are `str(uuid.uuid4())` (36-char UUID v4).
+_EXAMPLE_AGENT_UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+_EXAMPLE_TASK_UUID = "a3b2c1d0-e5f4-3210-abcd-ef1234567890"
+_EXAMPLE_TEST_UUID = "b1c2d3e4-f5a6-7890-bcde-f12345678901"
+
 
 class AgentTestsCreate(BaseModel):
-    agent_uuid: str
-    test_uuids: List[str]
+    agent_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Agent to link tests to. Must be in your workspace.",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
+    test_uuids: List[str] = Field(
+        description="Tests to link. Already-linked tests are skipped",
+        examples=[[_EXAMPLE_TEST_UUID]],
+    )
 
 
 class AgentTestDelete(BaseModel):
-    agent_uuid: str
-    test_uuid: str
+    agent_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Agent to unlink the test from",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
+    test_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Test to unlink from the agent",
+        examples=[_EXAMPLE_TEST_UUID],
+    )
 
 
 class AgentTestResponse(BaseModel):
-    id: int
-    agent_id: str
-    test_id: str
-    created_at: str
+    id: int = Field(description="Auto-increment link row ID")
+    agent_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Linked agent ID",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
+    test_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Linked test ID",
+        examples=[_EXAMPLE_TEST_UUID],
+    )
+    created_at: str = Field(description="Link creation timestamp (ISO 8601 UTC)")
 
 
 class AgentTestsCreateResponse(BaseModel):
-    ids: List[int]
-    message: str
+    ids: List[int] = Field(
+        description="Link row ids created this call (excludes tests that were already linked)"
+    )
+    message: str = Field(description="Human-readable confirmation message")
 
 
 class TestResponse(BaseModel):
-    uuid: str
-    name: str
-    type: str
-    config: Dict[str, Any] | None = None
-    created_at: str
-    updated_at: str
+    uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Test ID",
+        examples=[_EXAMPLE_TEST_UUID],
+    )
+    name: str = Field(description="Human-readable test name")
+    type: str = Field(
+        description="Test type: `response`, `tool_call`, or `conversation`"
+    )
+    config: Dict[str, Any] | None = Field(
+        None, description="Test configuration; null when the test has none"
+    )
+    created_at: str = Field(description="Creation timestamp (ISO 8601 UTC)")
+    updated_at: str = Field(description="Last-update timestamp (ISO 8601 UTC)")
 
 
 class AgentResponse(BaseModel):
-    uuid: str
-    name: str
-    type: Literal["agent", "connection"]
-    config: Dict[str, Any] | None = None
-    created_at: str
-    updated_at: str
+    uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Agent ID",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
+    name: str = Field(description="Human-readable agent name")
+    type: Literal["agent", "connection"] = Field(
+        description="`agent` (managed defaults) or `connection` (config you supply)"
+    )
+    config: Dict[str, Any] | None = Field(
+        None, description="Behavioral config; null when the agent has none"
+    )
+    created_at: str = Field(description="Creation timestamp (ISO 8601 UTC)")
+    updated_at: str = Field(description="Last-update timestamp (ISO 8601 UTC)")
 
 
 class RunTestRequest(BaseModel):
-    test_uuids: Optional[List[str]] = None
+    test_uuids: Optional[List[str]] = Field(
+        None,
+        description="Tests to run. Omit to run all tests linked to the agent",
+        examples=[[_EXAMPLE_TEST_UUID]],
+    )
+
+
+class AgentTestRunCreateResponse(BaseModel):
+    task_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Test run job ID. Poll for status and results",
+        examples=[_EXAMPLE_TASK_UUID],
+    )
+    status: str = Field(
+        description="Current status of the test run: `queued` or `in_progress`"
+    )
 
 
 class BatchRunRequest(BaseModel):
-    # Optional: when provided (and non-empty), run only these agents (validated
-    # up front). When omitted/null, run every agent in the caller's org.
-    agent_names: Optional[List[str]] = None
+    agent_names: Optional[List[str]] = Field(
+        None,
+        description="Agents to run. Omit to run every agent in your workspace",
+        examples=[["my-agent", "support-bot"]],
+    )
 
 
 class BatchTestRun(BaseModel):
-    agent_name: str
-    agent_uuid: str
-    task_id: str
-    status: str
+    agent_name: str = Field(description="Name of the agent")
+    agent_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="ID of the agent that was run",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
+    task_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Test run job ID. Poll for status and results",
+        examples=[_EXAMPLE_TASK_UUID],
+    )
+    status: str = Field(
+        description="Initial status: `queued` or `in_progress`"
+    )
 
 
 class BatchTestSkip(BaseModel):
-    agent_name: str
-    agent_uuid: str
-    reason: str  # "no_linked_tests" | "connection_not_verified"
+    agent_name: str = Field(description="Name of the skipped agent")
+    agent_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="ID of the skipped agent",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
+    reason: str = Field(
+        description="Why this agent was not run"
+    )
 
 
 class BatchTestRunResponse(BaseModel):
-    runs: List[BatchTestRun]
-    skipped: List[BatchTestSkip] = []
+    runs: List[BatchTestRun] = Field(
+        description="Test runs that were launched"
+    )
+    skipped: List[BatchTestSkip] = Field(
+        default=[],
+        description="Agents that were skipped instead of failing the batch",
+    )
 
 
 class ToolCallOutput(BaseModel):
-    tool: str
-    arguments: Optional[Dict[str, Any]] = None
-    # Tool execution result, surfaced only for agent-connection tests where the
-    # external agent actually runs the tool and echoes its return value. Any
-    # JSON value (object/list/string/number/...). Absent for calibrate-agent
-    # mode (tools are declared, never executed) and for agents that don't echo
-    # it. calibrate passes this through verbatim in `output.tool_calls`; without
-    # this field the response_model would drop it on serialization.
-    output: Optional[Any] = None
+    tool: str = Field(description="Name of the tool the agent called")
+    arguments: Optional[Dict[str, Any]] = Field(
+        None, description="Arguments the agent passed to the tool; null if none"
+    )
+    output: Optional[Any] = Field(
+        None,
+        description="Tool execution result (any JSON value). Present only for agent-connection tests where the external agent runs the tool and echoes its return value; null for calibrate-agent mode (tools are declared, never executed) or agents that don't echo it",
+    )
 
 
 class TestOutput(BaseModel):
-    response: Optional[str] = None
-    tool_calls: Optional[List[ToolCallOutput]] = None
+    response: Optional[str] = Field(
+        None, description="The agent's generated reply; null for tool-call-only cases"
+    )
+    tool_calls: Optional[List[ToolCallOutput]] = Field(
+        None, description="Tool calls the agent generated; null when it made none"
+    )
 
 
 class JudgeResult(BaseModel):
-    """One evaluator's verdict for a response-type test case.
-
-    Per-row data only — anything constant across rows for the same evaluator
-    (name, description, output_type, output_config, scale_min/max) lives on
-    the response-level `evaluators[]` block; look it up by `evaluator_uuid`.
-
-    `evaluator_uuid` is None for legacy runs that pre-date the evaluator-
-    snapshot capture or when the evaluator can't be resolved from the
-    snapshot.
-
-    Exactly one of `match` (binary) / `score` (rating) is set per entry;
-    both are None for tool-call tests, but tool-call tests don't carry
-    `judge_results`.
-
-    `variable_values` are the {{var}} substitutions used for this evaluator
-    on this test case, frozen from `test_evaluators.variable_values` at
-    submission time — stays on the row because it varies per test case.
-
-    `value_name` is the human-readable label for `match`/`score` resolved
-    against the rubric the run actually used (snapshot's
-    `output_config.scale.name`). Falls back to `Correct`/`Wrong` for binary
-    or the stringified score for rating when the snapshot lacks named
-    scale entries (e.g. legacy runs captured before the rubric was
-    snapshotted).
-    """
-
-    evaluator_uuid: Optional[str] = None
-    reasoning: Optional[str] = None
-    match: Optional[bool] = None
-    score: Optional[float] = None
-    value_name: Optional[str] = None
-    variable_values: Optional[Dict[str, Any]] = None
+    evaluator_uuid: Optional[str] = Field(
+        None,
+        min_length=36,
+        max_length=36,
+        description="ID of the evaluator that produced this verdict; null for legacy runs or when the evaluator can't be resolved from the snapshot",
+    )
+    reasoning: Optional[str] = Field(
+        None, description="Judge's rationale for this verdict"
+    )
+    match: Optional[bool] = Field(
+        None,
+        description="Binary evaluator pass/fail. **Set only for binary evaluators** (else null; `score` is set instead)",
+    )
+    score: Optional[float] = Field(
+        None,
+        description="Rating evaluator numeric score. **Set only for rating evaluators** (else null; `match` is set instead)",
+    )
+    value_name: Optional[str] = Field(
+        None,
+        description="Human-readable label for `match`/`score` resolved against the run's rubric. Falls back to `Correct`/`Wrong` (binary) or the stringified score (rating) when the snapshot lacks named scale entries",
+    )
+    variable_values: Optional[Dict[str, Any]] = Field(
+        None,
+        description="`{{var}}` substitutions used for this evaluator on this test case, frozen at submission time; null when none",
+    )
 
 
 class TestCaseResult(BaseModel):
-    """Result for a single test case matching calibrate results.json structure"""
-
-    test_case_id: Optional[str] = None
-    name: Optional[str] = None  # Test name, present during in-progress and done states
-    passed: Optional[bool] = None  # Only present when done
-    reasoning: Optional[str] = (
-        None  # LLM judge reasoning or deterministic diff; null for passing tool call tests
+    test_case_id: Optional[str] = Field(
+        None, description="Identifier of the test case within the run"
     )
-    output: Optional[TestOutput] = None  # Only present when done
-    test_case: Optional[Dict[str, Any]] = None  # Only present when done
-    # Per-evaluator verdicts for response-type tests; None for tool-call tests or
-    # in-progress rows. Names reflect the current DB value (refreshed on each read).
-    judge_results: Optional[List[JudgeResult]] = None
-    # Response-generation latency for this case in milliseconds (the agent under
-    # test, not the judge). Present only for live runs; None for in-progress rows
-    # and eval-only runs (no inference happened). Float, not int: calibrate rounds
-    # internal-model latency to a whole number, but external agent-connection tests
-    # self-report `metrics.latency_ms` verbatim and may send a fractional value.
-    latency_ms: Optional[float] = None
-    # Per-case cost in USD, lifted from calibrate's nested `output.cost` (NOT a
-    # top-level sibling of latency_ms — cost lives inside `output`). None when the
-    # provider/agent reports none (e.g. --provider openai, or no `metrics.cost`).
-    cost: Optional[float] = None
+    name: Optional[str] = Field(
+        None, description="Test name; present during in-progress and done states"
+    )
+    passed: Optional[bool] = Field(
+        None, description="Whether the case passed. Present only when done"
+    )
+    reasoning: Optional[str] = Field(
+        None,
+        description="LLM judge reasoning or deterministic tool-call diff; null for passing tool-call tests",
+    )
+    output: Optional[TestOutput] = Field(
+        None, description="The agent's output for this case. Present only when done"
+    )
+    test_case: Optional[Dict[str, Any]] = Field(
+        None, description="The input test case definition. Present only when done"
+    )
+    judge_results: Optional[List[JudgeResult]] = Field(
+        None,
+        description="Per-evaluator verdicts for response/conversation tests; null for tool-call tests or in-progress rows",
+    )
+    latency_ms: Optional[float] = Field(
+        None,
+        description="Response-generation latency in ms for the agent under test (not the judge). Present only for live runs; null for in-progress and eval-only runs. Float, since external agents may self-report a fractional value",
+    )
+    cost: Optional[float] = Field(
+        None,
+        description="Per-case cost in USD, lifted from calibrate's nested `output.cost`. Null when the provider/agent reports none (e.g. `--provider openai`)",
+    )
 
 
 class TestRunStatusResponse(BaseModel):
-    task_id: str
-    status: str
-    total_tests: Optional[int] = None
-    passed: Optional[int] = None
-    failed: Optional[int] = None
-    # Aggregated response-generation latency across cases: {p50, p95, p99, count}
-    # (millisecond values; p50 is the closest equivalent to the old `mean`).
-    # Omitted by calibrate for eval-only runs, so None then.
-    latency_ms: Optional[Dict[str, Any]] = None
-    # Aggregated cost across cases: {mean, min, max, count} (USD floats). Omitted
-    # by calibrate when no case reported a cost (e.g. openai provider), so None.
-    cost: Optional[Dict[str, Any]] = None
-    # Aggregated total token usage across cases: {mean, min, max, count}. Per-run
-    # token counts are ints but the aggregate `mean` can be fractional — values are
-    # `Any`, so don't assume int. Omitted by calibrate when no case reported usage.
-    total_tokens: Optional[Dict[str, Any]] = None
-    # Top-level evaluator block — name/description/output_type/rubric
-    # shared across every judge_results row. Per-row entries reference
-    # back via `evaluator_uuid` so the rubric isn't duplicated per test.
-    evaluators: Optional[List[Dict[str, Any]]] = None
-    results: Optional[List[TestCaseResult]] = None
-    results_s3_prefix: Optional[str] = None
-    error: bool = False
-    is_public: bool = False
-    share_token: Optional[str] = None
+    task_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Test run job ID",
+        examples=[_EXAMPLE_TASK_UUID],
+    )
+    status: str = Field(
+        description="Current status: `queued`, `in_progress`, `done`, or `failed`"
+    )
+    total_tests: Optional[int] = Field(
+        None, description="Total number of test cases; null until known"
+    )
+    passed: Optional[int] = Field(
+        None, description="Number of test cases that passed; null until done"
+    )
+    failed: Optional[int] = Field(
+        None, description="Number of test cases that failed; null until done"
+    )
+    latency_ms: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Aggregated response latency `{p50, p95, p99, count}` (ms; `p50` ≈ the old mean). Null for eval-only runs",
+    )
+    cost: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Aggregated cost `{mean, min, max, count}` (USD). Null when no case reported a cost (e.g. openai provider)",
+    )
+    total_tokens: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Aggregated token usage `{mean, min, max, count}` (values are `Any` — `mean` may be fractional). Null when no case reported usage",
+    )
+    evaluators: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="Top-level evaluator block (name/description/output_type/rubric) shared across every `judge_results` row, which references back via `evaluator_uuid` so the rubric isn't duplicated per case",
+    )
+    results: Optional[List[TestCaseResult]] = Field(
+        None, description="Per-test-case results; null until available"
+    )
+    results_s3_prefix: Optional[str] = Field(
+        None, description="S3 key prefix for the raw result artifacts; null until uploaded"
+    )
+    error: bool = Field(False, description="True if the run failed")
+    is_public: bool = Field(False, description="Whether the run is shared publicly")
+    share_token: Optional[str] = Field(
+        None, description="Public share token; null unless the run is public"
+    )
 
 
 class AgentTestRunListItem(BaseModel):
-    uuid: str
-    name: str  # Format: "Run {index}" or "Benchmark {index}"
-    status: str
-    type: str
-    updated_at: str
-    # Top-level evaluator block — see TestRunStatusResponse.evaluators.
-    evaluators: Optional[List[Dict[str, Any]]] = None
-    # Unit test results (for llm-unit-test type)
-    total_tests: Optional[int] = None
-    passed: Optional[int] = None
-    failed: Optional[int] = None
-    results: Optional[List[TestCaseResult]] = None
-    # Aggregated latency/cost/total_tokens for unit-test runs (see
-    # TestRunStatusResponse). None for benchmarks (per-model on model_results).
-    latency_ms: Optional[Dict[str, Any]] = None
-    cost: Optional[Dict[str, Any]] = None
-    total_tokens: Optional[Dict[str, Any]] = None
-    # Benchmark results (for llm-benchmark type)
-    model_results: Optional[List[Dict[str, Any]]] = None
-    leaderboard_summary: Optional[List[Dict[str, Any]]] = None
-    # Common fields
-    results_s3_prefix: Optional[str] = None
-    error: bool = False
-    is_public: bool = False
-    share_token: Optional[str] = None
+    uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Test run job ID",
+        examples=[_EXAMPLE_TASK_UUID],
+    )
+    name: str = Field(
+        description="Display name, e.g. `Run {index}` (unit test) or `Benchmark {index}`"
+    )
+    status: str = Field(
+        description="Job status: `queued`, `in_progress`, `done`, or `failed`"
+    )
+    type: str = Field(description="Job type: `llm-unit-test` or `llm-benchmark`")
+    updated_at: str = Field(description="Last-update timestamp (ISO 8601 UTC)")
+    evaluators: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Top-level evaluator block; see `TestRunStatusResponse.evaluators`"
+    )
+    total_tests: Optional[int] = Field(
+        None, description="Total test cases (unit-test runs); null for benchmarks or until known"
+    )
+    passed: Optional[int] = Field(None, description="Count of passing cases; null until done")
+    failed: Optional[int] = Field(None, description="Count of failing cases; null until done")
+    results: Optional[List[TestCaseResult]] = Field(
+        None, description="Per-test-case results for unit-test runs; null otherwise"
+    )
+    latency_ms: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Aggregated latency for unit-test runs; null for benchmarks (per-model on `model_results`)",
+    )
+    cost: Optional[Dict[str, Any]] = Field(
+        None, description="Aggregated cost for unit-test runs; null for benchmarks"
+    )
+    total_tokens: Optional[Dict[str, Any]] = Field(
+        None, description="Aggregated token usage for unit-test runs; null for benchmarks"
+    )
+    model_results: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Per-model results (benchmark runs); null for unit-test runs"
+    )
+    leaderboard_summary: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Leaderboard rows comparing models (benchmark runs); null otherwise"
+    )
+    results_s3_prefix: Optional[str] = Field(
+        None, description="S3 key prefix for the raw result artifacts; null until uploaded"
+    )
+    error: bool = Field(False, description="True if the run failed")
+    is_public: bool = Field(False, description="Whether the run is shared publicly")
+    share_token: Optional[str] = Field(
+        None, description="Public share token; null unless the run is public"
+    )
 
 
 class AgentTestRunsResponse(BaseModel):
-    runs: List[AgentTestRunListItem]
+    runs: List[AgentTestRunListItem] = Field(
+        description="Test runs for the agent, newest-updated first"
+    )
 
 
 class GlobalTestRunListItem(AgentTestRunListItem):
-    """AgentTestRunListItem extended with agent identity for the global view."""
-
-    agent_id: str
-    agent_name: str
+    agent_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Agent this run belongs to",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
+    agent_name: str = Field(description="Name of the agent this run belongs to")
 
 
 class GlobalTestRunsResponse(BaseModel):
-    runs: List[GlobalTestRunListItem]
+    runs: List[GlobalTestRunListItem] = Field(
+        description="Test runs across every agent in your workspace, newest-updated first"
+    )
 
 
-@router.post("", response_model=AgentTestsCreateResponse)
+@router.post(
+    "", response_model=AgentTestsCreateResponse, summary="Link tests to agent"
+)
 async def create_agent_test_links(agent_tests: AgentTestsCreate):
-    """Add tests to an agent."""
+    """Link one or more tests to an agent. Already-linked tests are skipped."""
     # Verify agent exists
     agent = get_agent(agent_tests.agent_uuid)
     if not agent:
@@ -391,16 +543,27 @@ async def create_agent_test_links(agent_tests: AgentTestsCreate):
     )
 
 
-@router.get("", response_model=List[AgentTestResponse])
+@router.get(
+    "", response_model=List[AgentTestResponse], summary="List agent-test links"
+)
 async def list_agent_tests():
     """List all agent-test links."""
     links = get_all_agent_tests()
     return links
 
 
-@router.get("/agent/{agent_uuid}/tests", response_model=List[TestResponse])
-async def get_agent_tests_endpoint(agent_uuid: str):
-    """Get all tests for a specific agent."""
+@router.get(
+    "/agent/{agent_uuid}/tests",
+    response_model=List[TestResponse],
+    summary="List tests for agent",
+)
+async def get_agent_tests_endpoint(
+    agent_uuid: str = PathParam(
+        description="Agent whose linked tests to list",
+        examples=[_EXAMPLE_AGENT_UUID],
+    ),
+):
+    """List the tests linked to an agent."""
     # Verify agent exists
     agent = get_agent(agent_uuid)
     if not agent:
@@ -465,13 +628,18 @@ def _build_agent_test_run_item_fields(job: Dict[str, Any], name: str) -> Dict[st
     }
 
 
-@router.get("/agent/{agent_uuid}/runs", response_model=AgentTestRunsResponse)
-async def get_agent_test_runs(agent_uuid: str):
-    """
-    Get all test runs for an agent.
-
-    Returns a list of all test runs (unit tests and benchmarks) with their UUID, status, type, name, and results.
-    """
+@router.get(
+    "/agent/{agent_uuid}/runs",
+    response_model=AgentTestRunsResponse,
+    summary="List test runs for agent",
+)
+async def get_agent_test_runs(
+    agent_uuid: str = PathParam(
+        description="Agent whose test runs to list",
+        examples=[_EXAMPLE_AGENT_UUID],
+    ),
+):
+    """List test runs for an agent, including status and results."""
     # Verify agent exists
     agent = get_agent(agent_uuid)
     if not agent:
@@ -504,22 +672,17 @@ async def get_agent_test_runs(agent_uuid: str):
     return AgentTestRunsResponse(runs=runs)
 
 
-@router.get("/runs", response_model=GlobalTestRunsResponse)
+@router.get(
+    "/runs", response_model=GlobalTestRunsResponse, summary="List test runs for workspace"
+)
 async def get_all_test_runs_for_user(
     ctx: OrgContext = Depends(get_current_org),
-    type: Optional[str] = None,
+    type: Optional[str] = Query(
+        None,
+        description="Filter by job type: `llm-unit-test` or `llm-benchmark`. Omit to return both",
+    ),
 ):
-    """
-    Get all test runs (unit tests and benchmarks) across every agent in the
-    caller's current org.
-
-    Optional query param:
-      ?type=llm-unit-test   — return only unit-test runs
-      ?type=llm-benchmark   — return only benchmark runs
-
-    Results are ordered newest-updated-first. Each item includes ``agent_id``
-    and ``agent_name`` so the frontend can group or label by agent.
-    """
+    """List all test runs in your workspace, newest first."""
     jobs = get_agent_test_jobs_for_org(ctx.org_uuid, job_type=type)
 
     # Per-agent counters for naming ("Run 1", "Benchmark 2", …).
@@ -556,9 +719,18 @@ async def get_all_test_runs_for_user(
     return GlobalTestRunsResponse(runs=runs)
 
 
-@router.get("/test/{test_uuid}/agents", response_model=List[AgentResponse])
-async def get_test_agents(test_uuid: str):
-    """Get all agents for a specific test."""
+@router.get(
+    "/test/{test_uuid}/agents",
+    response_model=List[AgentResponse],
+    summary="List agents for test",
+)
+async def get_test_agents(
+    test_uuid: str = PathParam(
+        description="Test whose linked agents to list",
+        examples=[_EXAMPLE_TEST_UUID],
+    ),
+):
+    """List the agents linked to a test."""
     # Verify test exists
     test = get_test(test_uuid)
     if not test:
@@ -568,9 +740,9 @@ async def get_test_agents(test_uuid: str):
     return agents
 
 
-@router.delete("")
+@router.delete("", summary="Unlink test from agent")
 async def delete_agent_test_link(agent_test: AgentTestDelete):
-    """Remove a test from an agent."""
+    """Unlink a test from an agent."""
     deleted = remove_test_from_agent(agent_test.agent_uuid, agent_test.test_uuid)
     if not deleted:
         raise HTTPException(status_code=404, detail="Agent-test link not found")
@@ -578,13 +750,21 @@ async def delete_agent_test_link(agent_test: AgentTestDelete):
 
 
 class AgentTestBulkDelete(BaseModel):
-    agent_uuid: str
-    test_uuids: List[str]
+    agent_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Agent to unlink tests from",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
+    test_uuids: List[str] = Field(
+        description="Tests to unlink from the agent; must be non-empty",
+        examples=[[_EXAMPLE_TEST_UUID]],
+    )
 
 
-@router.post("/bulk-unlink")
+@router.post("/bulk-unlink", summary="Bulk unlink tests from agent")
 async def bulk_delete_agent_test_links(payload: AgentTestBulkDelete):
-    """Remove multiple tests from an agent at once."""
+    """Unlink multiple tests from an agent."""
     if not payload.test_uuids:
         raise HTTPException(status_code=400, detail="test_uuids must not be empty")
 
@@ -604,31 +784,28 @@ async def bulk_delete_agent_test_links(payload: AgentTestBulkDelete):
 
 
 class AgentTestsBulkDeleteAll(BaseModel):
-    agent_uuid: str
-    # Required: the explicit set of test UUIDs to delete. Matches the
-    # `/bulk-unlink` sibling's contract — the FE always names the targets
-    # explicitly, so there's no implicit "delete every test on this agent"
-    # mode. Removes a class of footgun (a buggy FE blanking out an agent)
-    # and lets the response report exactly which UUIDs were processed
-    # without slicing tricks.
-    test_uuids: List[str]
+    agent_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Agent whose linked tests define the deletion scope",
+        examples=[_EXAMPLE_AGENT_UUID],
+    )
+    test_uuids: List[str] = Field(
+        description="Tests to soft-delete; must be non-empty. Only tests linked to this agent in your workspace are deleted — others are skipped",
+        examples=[[_EXAMPLE_TEST_UUID]],
+    )
 
 
-@router.post("/bulk-delete-tests")
+@router.post("/bulk-delete-tests", summary="Bulk delete agent tests")
 async def bulk_delete_agent_tests(
     payload: AgentTestsBulkDeleteAll,
     ctx: OrgContext = Depends(get_current_org),
 ):
-    """Hard-cousin of `/bulk-unlink`: instead of just unlinking, soft-delete
-    the named tests (and the link rows along with them). Only tests in the
-    caller's CURRENT ORG are deleted — UUIDs from other orgs (or that aren't
-    linked to this agent) are silently skipped, so this can't nuke a test
-    in another org and can't be used as a reconnaissance probe for foreign
-    test UUIDs.
-
-    `agent_uuid` is a sanity scope: every requested UUID must be linked
-    to this agent. Cross-agent deletes have to be sent as separate calls.
-    """
+    """Soft-delete tests linked to an agent, removing their links across every agent."""
+    # Unlike `/bulk-unlink`, this deletes the test rows (not just links). Only
+    # tests in your workspace that are linked to `agent_uuid` are deleted;
+    # foreign or unlinked IDs are silently skipped. Deleting a test cascades
+    # to remove its links across every agent, not just this one.
     if not payload.test_uuids:
         raise HTTPException(status_code=400, detail="test_uuids must not be empty")
 
@@ -1936,24 +2113,23 @@ def _launch_agent_test_run(
     return job_id, initial_status
 
 
-@router.post("/agent/{agent_uuid}/run", response_model=TaskCreateResponse, tags=["Public API"])
+@router.post(
+    "/agent/{agent_uuid}/run",
+    response_model=AgentTestRunCreateResponse,
+    tags=["Public API"],
+    summary="Run agent tests",
+)
 async def run_agent_test(
-    agent_uuid: str,
-    request: RunTestRequest,
+    agent_uuid: str = PathParam(
+        description="The agent to test. Must be in your workspace.",
+        examples=[_EXAMPLE_AGENT_UUID],
+    ),
+    request: RunTestRequest = ...,
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
-    """
-    Run one or more tests for an agent.
-
-    This starts a background task that runs the calibrate LLM tests command
-    with the agent's config and the combined test cases from all specified tests.
-
-    Returns a task ID that can be used to poll for status and results.
-
-    Auth: requires either a JWT (frontend) or an `sk_` API key. The agent
-    must belong to the caller's org or this 404s.
-    """
-    # Verify agent exists and belongs to the caller's org.
+    """Run tests for an agent as a background job."""
+    # Public API (auth via get_org_jwt_or_api_key). Verify the agent exists and
+    # belongs to the caller's workspace (404 otherwise).
     agent = get_agent(agent_uuid)
     if not agent or agent.get("org_uuid") != ctx.org_uuid:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -1995,7 +2171,7 @@ async def run_agent_test(
         raise HTTPException(status_code=500, detail=str(e))
 
     job_id, initial_status = _launch_agent_test_run(agent, tests, s3_bucket)
-    return TaskCreateResponse(task_id=job_id, status=initial_status)
+    return AgentTestRunCreateResponse(task_id=job_id, status=initial_status)
 
 
 def _run_tests_for_agents(
@@ -2006,7 +2182,7 @@ def _run_tests_for_agents(
     Agents with no linked tests or an unverified connection are skipped and
     reported under ``skipped`` rather than aborting the whole batch. Each launched
     agent yields one ``llm-unit-test`` job (its task_id), subject to the normal
-    per-org concurrency queue — over-limit jobs come back ``queued``.
+    per-workspace concurrency queue — over-limit jobs come back ``queued``.
     """
     runs: List[BatchTestRun] = []
     skipped: List[BatchTestSkip] = []
@@ -2050,30 +2226,14 @@ def _run_tests_for_agents(
     "/run",
     response_model=BatchTestRunResponse,
     tags=["Public API"],
+    summary="Run agent tests in batch",
 )
 async def run_tests_batch(
     request: Optional[BatchRunRequest] = None,
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
-    """Run every linked test for a set of agents, one ``llm-unit-test`` job per agent.
-
-    Scope is driven by the optional ``agent_names`` payload:
-
-    - **Provided (non-empty)** — run only those agents. Names are unique per org
-      and **all are validated up front**: if any doesn't resolve to a
-      (non-deleted) agent in the caller's org, the call 404s with the offending
-      names and NO jobs are created.
-    - **Omitted / null / empty** — run every agent in the caller's org.
-
-    For each selected agent, its linked tests are launched as one job. Agents
-    with no linked tests or an unverified connection are reported under
-    ``skipped`` instead of failing the batch. Subject to the normal per-org
-    concurrency queue, so over-limit jobs come back ``queued``.
-
-    Auth accepts a JWT (frontend) or an `sk_` API key (programmatic clients).
-    Returns one ``runs`` entry per launched agent with ``agent_name``,
-    ``agent_uuid``, ``task_id``, and ``status``.
-    """
+    """Run agent tests for every agent in your workspace, or for a selected set."""
+    # Public API (auth via get_org_jwt_or_api_key).
     agent_names = request.agent_names if request else None
 
     org_agents = get_all_agents(org_uuid=ctx.org_uuid)
@@ -2110,14 +2270,14 @@ async def run_tests_batch(
 
 
 def _load_owned_agent_test_job(task_id: str, ctx: OrgContext) -> Dict[str, Any]:
-    """Fetch an agent-test job and assert the caller's org owns it.
+    """Fetch an agent-test job and assert the caller's workspace owns it.
 
     Ownership is derived through the job's parent agent (``agent_test_jobs`` has
-    no org column of its own). Returns the job dict on success; raises 404 with
-    the same generic ``"Task not found"`` detail for the missing / cross-org /
+    no workspace column of its own). Returns the job dict on success; raises 404 with
+    the same generic ``"Task not found"`` detail for the missing / cross-workspace /
     orphaned cases so existence is never leaked. A soft-deleted agent makes its
     runs unreadable here (``get_agent`` filters ``deleted_at``), consistent with
-    the org-wide runs list. Used by the run/benchmark status and visibility
+    the workspace-wide runs list. Used by the run/benchmark status and visibility
     endpoints — keep the rule in this one place.
     """
     job = get_agent_test_job(task_id)
@@ -2133,21 +2293,33 @@ def _load_owned_agent_test_job(task_id: str, ctx: OrgContext) -> Dict[str, Any]:
 
 
 class VisibilityRequest(BaseModel):
-    is_public: bool
+    is_public: bool = Field(
+        description="True to make the run publicly shareable (mints a share token); False to make it private"
+    )
 
 
 class VisibilityResponse(BaseModel):
-    is_public: bool
-    share_token: str | None = None
+    is_public: bool = Field(description="Whether the run is now shared publicly")
+    share_token: str | None = Field(
+        None,
+        description="Share token to build the public URL; null when the run is private",
+    )
 
 
-@router.patch("/run/{task_id}/visibility", response_model=VisibilityResponse)
+@router.patch(
+    "/run/{task_id}/visibility",
+    response_model=VisibilityResponse,
+    summary="Update test run visibility",
+)
 async def update_test_run_visibility(
-    task_id: str,
-    body: VisibilityRequest,
+    task_id: str = PathParam(
+        description="Test run whose sharing settings to update",
+        examples=[_EXAMPLE_TASK_UUID],
+    ),
+    body: VisibilityRequest = ...,
     ctx: OrgContext = Depends(get_current_org),
 ):
-    """Toggle public sharing for an agent test run."""
+    """Toggle public sharing for a test run."""
     job = _load_owned_agent_test_job(task_id, ctx)
 
     if body.is_public:
@@ -2161,21 +2333,21 @@ async def update_test_run_visibility(
     return VisibilityResponse(is_public=body.is_public, share_token=share_token)
 
 
-@router.get("/run/{task_id}", response_model=TestRunStatusResponse, tags=["Public API"])
+@router.get(
+    "/run/{task_id}",
+    response_model=TestRunStatusResponse,
+    tags=["Public API"],
+    summary="Get test run status",
+)
 async def get_agent_test_run_status(
-    task_id: str,
+    task_id: str = PathParam(
+        description="Test run to poll for status and results",
+        examples=[_EXAMPLE_TASK_UUID],
+    ),
     ctx: OrgContext = Depends(get_org_jwt_or_api_key),
 ):
-    """
-    Get the status of an agent test run.
-
-    Requires either a JWT (frontend) or an `sk_` API key, plus org
-    ownership of the run. Unauthenticated access to a completed run is only
-    possible once it is made public, via the share-token endpoint in the public
-    router.
-
-    Returns the current status and, if done, the test results.
-    """
+    """Get the status and results of a test run."""
+    # Public API (auth via get_org_jwt_or_api_key); ownership enforced below.
     job = _load_owned_agent_test_job(task_id, ctx)
 
     status = job["status"]
@@ -2233,46 +2405,72 @@ async def get_agent_test_run_status(
 
 
 class BenchmarkRequest(BaseModel):
-    models: List[str]  # List of model names to benchmark
-    # Optional subset of the agent's linked tests to benchmark. Each uuid must be
-    # linked to the agent (404 otherwise). Omit/null/empty ⇒ all linked tests.
-    test_uuids: Optional[List[str]] = None
+    models: List[str] = Field(
+        description="Model names to benchmark on the same tests; must be non-empty"
+    )
+    test_uuids: Optional[List[str]] = Field(
+        None,
+        description="Subset of the agent's linked tests to benchmark. Each ID must be linked to the agent. Omit to run all linked tests",
+        examples=[[_EXAMPLE_TEST_UUID]],
+    )
 
 
 class ModelResult(BaseModel):
-    model: str
-    success: Optional[bool] = None  # None while queued/processing, True/False when done
-    message: str
-    total_tests: Optional[int] = None
-    passed: Optional[int] = None
-    failed: Optional[int] = None
-    evaluator_summary: Optional[List[Dict[str, Any]]] = None
-    test_results: Optional[List[Dict[str, Any]]] = None
-    # Aggregated metrics for this model. latency_ms is {p50, p95, p99, count}
-    # (calibrate switched latency to percentiles; p50 ≈ the old mean); cost and
-    # total_tokens stay {mean, min, max, count}. Values are `Any` — don't assume
-    # int: even total_tokens (per-run an int) has a fractional `mean`, and
-    # latency/cost are floats. Lets the frontend compare models on latency, cost,
-    # and token usage. None when calibrate omits it (eval-only / openai provider)
-    # or before this model's metrics are ready.
-    latency_ms: Optional[Dict[str, Any]] = None
-    cost: Optional[Dict[str, Any]] = None
-    total_tokens: Optional[Dict[str, Any]] = None
+    model: str = Field(description="Model name these results are for")
+    success: Optional[bool] = Field(
+        None, description="Whether this model's run succeeded; null while queued/processing"
+    )
+    message: str = Field(description="Human-readable status/result message for this model")
+    total_tests: Optional[int] = Field(None, description="Total test cases for this model; null until known")
+    passed: Optional[int] = Field(None, description="Count of passing cases; null until done")
+    failed: Optional[int] = Field(None, description="Count of failing cases; null until done")
+    evaluator_summary: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Per-evaluator aggregate summary for this model; null until done"
+    )
+    test_results: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Per-test-case results for this model; null until available"
+    )
+    latency_ms: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Aggregated latency `{p50, p95, p99, count}` (ms; `p50` ≈ the old mean). Null when calibrate omits it (eval-only/openai) or before this model's metrics are ready",
+    )
+    cost: Optional[Dict[str, Any]] = Field(
+        None, description="Aggregated cost `{mean, min, max, count}` (USD); null when unavailable"
+    )
+    total_tokens: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Aggregated token usage `{mean, min, max, count}` (values are `Any` — `mean` may be fractional); null when unavailable",
+    )
 
 
 class BenchmarkStatusResponse(BaseModel):
-    task_id: str
-    status: str
-    # Top-level evaluator block — see TestRunStatusResponse.evaluators.
-    # Shared by every model's test_results since all models run the
-    # same suite.
-    evaluators: Optional[List[Dict[str, Any]]] = None
-    model_results: Optional[List[ModelResult]] = None
-    leaderboard_summary: Optional[List[Dict[str, Any]]] = None
-    results_s3_prefix: Optional[str] = None
-    error: bool = False
-    is_public: bool = False
-    share_token: Optional[str] = None
+    task_id: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Benchmark run job ID",
+        examples=[_EXAMPLE_TASK_UUID],
+    )
+    status: str = Field(
+        description="Job status: `queued`, `in_progress`, `done`, or `failed`"
+    )
+    evaluators: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="Top-level evaluator block shared by every model's results (all models run the same suite); see `TestRunStatusResponse.evaluators`",
+    )
+    model_results: Optional[List[ModelResult]] = Field(
+        None, description="Per-model results; null until available"
+    )
+    leaderboard_summary: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Leaderboard rows comparing the models; null until done"
+    )
+    results_s3_prefix: Optional[str] = Field(
+        None, description="S3 key prefix for the raw result artifacts; null until uploaded"
+    )
+    error: bool = Field(False, description="True if the run failed")
+    is_public: bool = Field(False, description="Whether the run is shared publicly")
+    share_token: Optional[str] = Field(
+        None, description="Public share token; null unless the run is public"
+    )
 
 
 def _update_benchmark_intermediate_results(
@@ -2776,20 +2974,20 @@ def run_benchmark_task(
         try_start_queued_agent_test_job(AGENT_TEST_JOB_TYPES)
 
 
-@router.post("/agent/{agent_uuid}/benchmark", response_model=TaskCreateResponse)
+@router.post(
+    "/agent/{agent_uuid}/benchmark",
+    response_model=TaskCreateResponse,
+    summary="Run agent benchmark",
+)
 async def run_agent_benchmark(
-    agent_uuid: str,
-    request: BenchmarkRequest,
+    agent_uuid: str = PathParam(
+        description="Agent to benchmark. Must be in your workspace.",
+        examples=[_EXAMPLE_AGENT_UUID],
+    ),
+    request: BenchmarkRequest = ...,
     ctx: OrgContext = Depends(get_current_org),
 ):
-    """
-    Run a benchmark comparing multiple models on the same tests.
-
-    This starts a background task that runs the calibrate LLM tests command
-    for each model in parallel, then generates a leaderboard comparing results.
-
-    Returns a task ID that can be used to poll for status and results.
-    """
+    """Run a multi-model benchmark on an agent's linked tests as a background job."""
     # Verify agent exists and belongs to the caller's org.
     agent = get_agent(agent_uuid)
     if not agent or agent.get("org_uuid") != ctx.org_uuid:
@@ -2903,10 +3101,17 @@ async def run_agent_benchmark(
     return TaskCreateResponse(task_id=job_id, status=initial_status)
 
 
-@router.patch("/benchmark/{task_id}/visibility", response_model=VisibilityResponse)
+@router.patch(
+    "/benchmark/{task_id}/visibility",
+    response_model=VisibilityResponse,
+    summary="Update benchmark visibility",
+)
 async def update_benchmark_visibility(
-    task_id: str,
-    body: VisibilityRequest,
+    task_id: str = PathParam(
+        description="Benchmark run whose sharing settings to update",
+        examples=[_EXAMPLE_TASK_UUID],
+    ),
+    body: VisibilityRequest = ...,
     ctx: OrgContext = Depends(get_current_org),
 ):
     """Toggle public sharing for a benchmark run."""
@@ -2923,20 +3128,19 @@ async def update_benchmark_visibility(
     return VisibilityResponse(is_public=body.is_public, share_token=share_token)
 
 
-@router.get("/benchmark/{task_id}", response_model=BenchmarkStatusResponse)
+@router.get(
+    "/benchmark/{task_id}",
+    response_model=BenchmarkStatusResponse,
+    summary="Get benchmark status",
+)
 async def get_benchmark_status(
-    task_id: str,
+    task_id: str = PathParam(
+        description="Benchmark run to poll for status and results",
+        examples=[_EXAMPLE_TASK_UUID],
+    ),
     ctx: OrgContext = Depends(get_current_org),
 ):
-    """
-    Get the status of a benchmark run.
-
-    Requires a valid JWT and org ownership of the run. Unauthenticated access
-    to a completed run is only possible once it is made public, via the
-    share-token endpoint in the public router.
-
-    Returns the current status and, if done, results for each model and leaderboard.
-    """
+    """Get the status and results of a benchmark run."""
     job = _load_owned_agent_test_job(task_id, ctx)
 
     status = job["status"]
@@ -2985,11 +3189,15 @@ async def get_benchmark_status(
     )
 
 
-@router.delete("/job/{job_uuid}")
+@router.delete("/job/{job_uuid}", summary="Delete test job")
 async def delete_agent_test_job_endpoint(
-    job_uuid: str, ctx: OrgContext = Depends(get_current_org)
+    job_uuid: str = PathParam(
+        description="Test or benchmark job to delete",
+        examples=[_EXAMPLE_TASK_UUID],
+    ),
+    ctx: OrgContext = Depends(get_current_org),
 ):
-    """Delete an agent test job. Only members of the parent agent's org can delete."""
+    """Delete an agent test or benchmark job."""
     job = get_agent_test_job(job_uuid)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")

@@ -1,7 +1,13 @@
+"""Workspace eval limits (superadmin configuration).
+
+Set per-workspace caps on dataset rows per eval run. Members can read their
+workspace's effective limit via `/me/max-rows-per-eval`.
+"""
+
 import os
 import sqlite3
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Path
 from pydantic import BaseModel, Field
 
 from db import (
@@ -20,49 +26,69 @@ DEFAULT_MAX_ROWS_PER_EVAL = int(os.getenv("DEFAULT_MAX_ROWS_PER_EVAL", "20"))
 
 
 class OrgLimits(BaseModel):
-    max_rows_per_eval: int = Field(gt=0, le=10000)
+    max_rows_per_eval: int = Field(
+        gt=0,
+        le=10000,
+        description="Maximum dataset rows a single eval run may process",
+    )
 
 
 class OrgLimitsCreate(BaseModel):
-    org_uuid: str
-    limits: OrgLimits
+    org_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Workspace to create limits for",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    )
+    limits: OrgLimits = Field(description="Limit values to set")
 
 
 class OrgLimitsUpdate(BaseModel):
-    limits: OrgLimits
+    limits: OrgLimits = Field(description="New limit values")
 
 
 class OrgLimitsResponse(BaseModel):
-    uuid: str
-    org_uuid: str
-    limits: OrgLimits
-    created_at: str
-    updated_at: str
+    uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Limits record ID",
+    )
+    org_uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="Workspace these limits apply to",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    )
+    limits: OrgLimits = Field(description="Current limit values")
+    created_at: str = Field(description="When the limits record was created (ISO 8601 UTC)")
+    updated_at: str = Field(description="When the limits record was last updated (ISO 8601 UTC)")
 
 
 class OrgLimitsCreateResponse(BaseModel):
-    uuid: str
-    message: str
+    uuid: str = Field(
+        min_length=36,
+        max_length=36,
+        description="ID of the newly created limits record",
+    )
+    message: str = Field(description="Status message")
 
 
-@router.get("/me/max-rows-per-eval")
+@router.get("/me/max-rows-per-eval", summary="Get own max rows per eval")
 async def get_max_rows_per_eval(ctx: OrgContext = Depends(get_current_org)):
-    """Get the max rows per eval for the caller's current org.
-
-    Returns the org-specific value from org_limits if set,
-    otherwise falls back to DEFAULT_MAX_ROWS_PER_EVAL.
-    """
+    """Get the max rows per eval for your workspace."""
+    # Falls back to DEFAULT_MAX_ROWS_PER_EVAL when no workspace-specific limit is set.
     limits = get_org_limits(ctx.org_uuid)
     if limits and "max_rows_per_eval" in limits.get("limits", {}):
         return {"max_rows_per_eval": limits["limits"]["max_rows_per_eval"]}
     return {"max_rows_per_eval": DEFAULT_MAX_ROWS_PER_EVAL}
 
 
-@router.post("", response_model=OrgLimitsCreateResponse)
+@router.post("", response_model=OrgLimitsCreateResponse, summary="Create workspace limits")
 async def create_org_limits_endpoint(
     data: OrgLimitsCreate, user_id: str = Depends(require_superadmin)
 ):
-    """Create limits for an org. Superadmin only."""
+    """Create limits for a workspace. Superadmin only."""
+    # 404 if workspace missing; 409 if limits already exist (use PUT to update).
     if not get_organization(data.org_uuid):
         raise HTTPException(status_code=404, detail="Organization not found")
     existing = get_org_limits(data.org_uuid)
@@ -83,11 +109,15 @@ async def create_org_limits_endpoint(
     )
 
 
-@router.get("/{target_org_uuid}", response_model=OrgLimitsResponse)
+@router.get("/{target_org_uuid}", response_model=OrgLimitsResponse, summary="Get workspace limits")
 async def get_org_limits_endpoint(
-    target_org_uuid: str, ctx: OrgContext = Depends(get_current_org)
+    target_org_uuid: str = Path(
+        description="The workspace whose limits to read. You must be a member.",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
+    ctx: OrgContext = Depends(get_current_org),
 ):
-    """Get limits for an org. Must be a member of the target org."""
+    """Get limits for a workspace you belong to."""
     if get_member_role(target_org_uuid, ctx.user_id) is None and not is_superadmin_user(ctx.user_id):
         raise HTTPException(status_code=404, detail="Organization limits not found")
     limits = get_org_limits(target_org_uuid)
@@ -96,24 +126,31 @@ async def get_org_limits_endpoint(
     return limits
 
 
-@router.put("/{target_org_uuid}", response_model=OrgLimitsResponse)
+@router.put("/{target_org_uuid}", response_model=OrgLimitsResponse, summary="Update workspace limits")
 async def update_org_limits_endpoint(
-    target_org_uuid: str,
-    data: OrgLimitsUpdate,
+    target_org_uuid: str = Path(
+        description="The workspace whose limits to update",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
+    data: OrgLimitsUpdate = ...,
     user_id: str = Depends(require_superadmin),
 ):
-    """Update limits for an org. Superadmin only."""
+    """Update limits for a workspace. Superadmin only."""
     updated = update_org_limits(org_uuid=target_org_uuid, limits=data.limits)
     if not updated:
         raise HTTPException(status_code=404, detail="Organization limits not found")
     return updated
 
 
-@router.delete("/{target_org_uuid}")
+@router.delete("/{target_org_uuid}", summary="Delete workspace limits")
 async def delete_org_limits_endpoint(
-    target_org_uuid: str, user_id: str = Depends(require_superadmin)
+    target_org_uuid: str = Path(
+        description="The workspace whose limits to delete",
+        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
+    ),
+    user_id: str = Depends(require_superadmin),
 ):
-    """Delete limits for an org. Superadmin only."""
+    """Delete limits for a workspace, reverting it to the server default. Superadmin only."""
     deleted = delete_org_limits(target_org_uuid)
     if not deleted:
         raise HTTPException(status_code=404, detail="Organization limits not found")
