@@ -18,6 +18,12 @@ from db import (
     set_test_evaluators,
 )
 from auth_utils import get_current_org, get_org_jwt_or_api_key, OrgContext
+from utils import (
+    EXAMPLE_TEST_UUID,
+    TEST_TYPE_DESCRIPTION,
+    TestListResponse,
+    to_test_list_response,
+)
 
 import logging
 
@@ -26,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tests", tags=["tests"])
 
-_EXAMPLE_TEST_UUID = "b1c2d3e4-f5a6-7890-bcde-f12345678901"
 _EXAMPLE_EVALUATOR_UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 _EXAMPLE_AGENT_UUID = "a3b2c1d0-e5f4-3210-abcd-ef1234567890"
 
@@ -35,12 +40,8 @@ TestType = Literal["response", "tool_call", "conversation"]
 
 # Shared across every `type` field (create/update/response/bulk) so the gloss
 # stays identical everywhere it renders.
-_TEST_TYPE_DESCRIPTION = (
-    "What the test judges:\n\n"
-    "- `response`: judges the generated reply\n"
-    "- `tool_call`: diffs the generated tool calls\n"
-    "- `conversation`: judges the full conversation\n"
-)
+# Single source of truth lives in utils (shared with the trimmed list shape).
+_TEST_TYPE_DESCRIPTION = TEST_TYPE_DESCRIPTION
 
 # Test name uniqueness is workspace-scoped on single create; bulk create adds
 # batch-level uniqueness on top (both are enforced). Share the base so the two
@@ -182,7 +183,7 @@ class TestResponse(BaseModel):
         min_length=36,
         max_length=36,
         description="Unique ID for the test",
-        examples=[_EXAMPLE_TEST_UUID],
+        examples=[EXAMPLE_TEST_UUID],
     )
     name: str = Field(description="Name of the test")
     type: TestType = Field(description=_TEST_TYPE_DESCRIPTION)
@@ -207,7 +208,7 @@ class TestCreateResponse(BaseModel):
         min_length=36,
         max_length=36,
         description="ID of the newly created test",
-        examples=[_EXAMPLE_TEST_UUID],
+        examples=[EXAMPLE_TEST_UUID],
     )
     message: str = Field(description="Confirmation message")
 
@@ -324,7 +325,7 @@ class BulkTestUpload(BaseModel):
 class BulkTestUploadResponse(BaseModel):
     uuids: List[str] = Field(
         description="IDs of the created tests, in request order",
-        examples=[[_EXAMPLE_TEST_UUID]],
+        examples=[[EXAMPLE_TEST_UUID]],
     )
     count: int = Field(description="Number of tests created")
     message: str = Field(description="Confirmation message")
@@ -337,7 +338,7 @@ class BulkTestUploadResponse(BaseModel):
 class BulkTestDelete(BaseModel):
     test_uuids: List[str] = Field(
         description="IDs of the tests to delete",
-        examples=[[_EXAMPLE_TEST_UUID]],
+        examples=[[EXAMPLE_TEST_UUID]],
     )
 
 
@@ -543,14 +544,14 @@ async def create_test_endpoint(
 
 @router.get(
     "",
-    response_model=List[TestResponse],
+    response_model=List[TestListResponse],
     tags=["Public API"],
     summary="List tests",
 )
 async def list_tests(ctx: OrgContext = Depends(get_org_jwt_or_api_key)):
     """List all the test cases for your agents"""
     tests = get_all_tests(org_uuid=ctx.org_uuid)
-    return [_with_evaluators(t) for t in tests]
+    return [to_test_list_response(t) for t in tests]
 
 
 @router.get(

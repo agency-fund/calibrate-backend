@@ -45,7 +45,9 @@ from utils import (
     TaskStatus,
     InitialTaskStatus,
     TaskCreateResponse,
-    TestTypeLiteral,
+    EXAMPLE_TEST_UUID,
+    TestListResponse,
+    to_test_list_response,
     OutputTypeLiteral,
     AGENT_TYPE_DESCRIPTION,
     AgentTestJobType,
@@ -146,7 +148,6 @@ router = APIRouter(prefix="/agent-tests", tags=["agent-tests"])
 # Doc-only examples — IDs are `str(uuid.uuid4())` (36-char UUID v4).
 _EXAMPLE_AGENT_UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 _EXAMPLE_TASK_UUID = "a3b2c1d0-e5f4-3210-abcd-ef1234567890"
-_EXAMPLE_TEST_UUID = "b1c2d3e4-f5a6-7890-bcde-f12345678901"
 
 _TASK_STATUS_DESCRIPTION = "Current status of the run"
 
@@ -187,7 +188,7 @@ class AgentTestsCreate(BaseModel):
     )
     test_uuids: List[str] = Field(
         description="Tests to link. Any that are already linked are skipped",
-        examples=[[_EXAMPLE_TEST_UUID]],
+        examples=[[EXAMPLE_TEST_UUID]],
     )
 
 
@@ -202,7 +203,7 @@ class AgentTestDelete(BaseModel):
         min_length=36,
         max_length=36,
         description="Test to unlink from the agent",
-        examples=[_EXAMPLE_TEST_UUID],
+        examples=[EXAMPLE_TEST_UUID],
     )
 
 
@@ -218,7 +219,7 @@ class AgentTestResponse(BaseModel):
         min_length=36,
         max_length=36,
         description="The linked test",
-        examples=[_EXAMPLE_TEST_UUID],
+        examples=[EXAMPLE_TEST_UUID],
     )
     created_at: str = Field(description="When the link was created (ISO 8601 UTC)")
 
@@ -228,29 +229,6 @@ class AgentTestsCreateResponse(BaseModel):
         description="Identifiers for the links created by this call. Tests that were already linked are excluded"
     )
     message: str = Field(description="Confirmation message")
-
-
-class TestResponse(BaseModel):
-    uuid: str = Field(
-        min_length=36,
-        max_length=36,
-        description="Test ID",
-        examples=[_EXAMPLE_TEST_UUID],
-    )
-    name: str = Field(description="Name of the test")
-    type: TestTypeLiteral = Field(
-        description=(
-            "What the test checks:\n"
-            "- `response`: judges the reply the agent generates\n"
-            "- `tool_call`: checks the tool calls the agent makes\n"
-            "- `conversation`: judges the full conversation after the agent replies"
-        )
-    )
-    config: Dict[str, Any] | None = Field(
-        None, description="Test configuration"
-    )
-    created_at: str = Field(description="When the test was created (ISO 8601 UTC)")
-    updated_at: str = Field(description="When the test was last updated (ISO 8601 UTC)")
 
 
 class AgentResponse(BaseModel):
@@ -273,7 +251,7 @@ class RunTestRequest(BaseModel):
     test_uuids: Optional[List[str]] = Field(
         None,
         description="Tests to run. Omit to run all tests linked to the agent",
-        examples=[[_EXAMPLE_TEST_UUID]],
+        examples=[[EXAMPLE_TEST_UUID]],
     )
 
 
@@ -666,7 +644,7 @@ async def list_agent_tests():
 
 @router.get(
     "/agent/{agent_uuid}/tests",
-    response_model=List[TestResponse],
+    response_model=List[TestListResponse],
     summary="List tests for agent",
     tags=["Public API"],
 )
@@ -684,8 +662,10 @@ async def get_agent_tests_endpoint(
     if not agent or agent.get("org_uuid") != ctx.org_uuid:
         raise HTTPException(status_code=404, detail="Agent not found")
 
+    # Trimmed list shape: uuid/name/type + config.description only, no evaluator
+    # hydration. Callers refetch a full test by ID when they need config/evaluators.
     tests = get_tests_for_agent(agent_uuid)
-    return tests
+    return [to_test_list_response(t) for t in tests]
 
 
 def _slim_test_results(test_results: Any) -> Optional[List[Dict[str, Any]]]:
@@ -874,7 +854,7 @@ async def get_all_test_runs_for_user(
 async def get_test_agents(
     test_uuid: str = PathParam(
         description="Test whose linked agents to list",
-        examples=[_EXAMPLE_TEST_UUID],
+        examples=[EXAMPLE_TEST_UUID],
     ),
 ):
     """List the agents linked to a test."""
@@ -905,7 +885,7 @@ class AgentTestBulkDelete(BaseModel):
     )
     test_uuids: List[str] = Field(
         description="Tests to unlink from the agent",
-        examples=[[_EXAMPLE_TEST_UUID]],
+        examples=[[EXAMPLE_TEST_UUID]],
     )
 
 
@@ -939,7 +919,7 @@ class AgentTestsBulkDeleteAll(BaseModel):
     )
     test_uuids: List[str] = Field(
         description="Tests to delete. Only tests linked to this agent in your workspace are deleted. Others are skipped",
-        examples=[[_EXAMPLE_TEST_UUID]],
+        examples=[[EXAMPLE_TEST_UUID]],
     )
 
 
@@ -2561,7 +2541,7 @@ class BenchmarkRequest(BaseModel):
     test_uuids: Optional[List[str]] = Field(
         None,
         description="A subset of the agent's linked tests to benchmark. Each ID must be linked to the agent. Omit to run all linked tests",
-        examples=[[_EXAMPLE_TEST_UUID]],
+        examples=[[EXAMPLE_TEST_UUID]],
     )
 
 
