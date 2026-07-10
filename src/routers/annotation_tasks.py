@@ -19,6 +19,7 @@ from db import (
     remove_evaluator_from_annotation_task,
     reorder_evaluators_for_annotation_task,
     get_evaluators_for_annotation_task,
+    get_evaluators_for_annotation_tasks,
     get_evaluator,
     get_evaluator_version,
     get_annotations_for_task,
@@ -451,8 +452,14 @@ async def create_annotation_task_endpoint(
 async def list_annotation_tasks(ctx: OrgContext = Depends(get_org_jwt_or_api_key)):
     """List annotation tasks with linked evaluators"""
     tasks = get_all_annotation_tasks(org_uuid=ctx.org_uuid)
+    # Fetch all linked evaluators for the page in ONE query, then bucket by task
+    # uuid — avoids a per-task N+1 (mirrors the pre-fetch/bucket pattern used in
+    # `get_annotation_task_endpoint`).
+    evaluators_by_task = get_evaluators_for_annotation_tasks(
+        [task["uuid"] for task in tasks]
+    )
     for task in tasks:
-        task["evaluators"] = get_evaluators_for_annotation_task(task["uuid"])
+        task["evaluators"] = evaluators_by_task.get(task["uuid"], [])
     return tasks
 
 
@@ -564,24 +571,41 @@ async def list_task_evaluators(
         _live_version_index,
         _version_dict,
     )
-    from db import get_evaluator_versions
+    from db import (
+        get_evaluators_by_uuids,
+        get_evaluator_versions_by_uuids,
+        get_evaluator_versions_for_evaluators,
+    )
 
     _ensure_owned_task(task_uuid, ctx.org_uuid)
     # `get_evaluators_for_annotation_task` projects a slim column set with a
     # `linked_at` alias on the pivot — it omits the evaluator row's own
-    # `created_at`/`updated_at`. Refetch the canonical evaluator row so
-    # `_evaluator_response` has every field it expects.
+    # `created_at`/`updated_at`. Refetch the canonical evaluator rows so
+    # `_evaluator_response` has every field it expects — but do it in THREE
+    # batched queries for the whole linked set (evaluators, their live versions,
+    # their full version histories) instead of ~3 queries per evaluator (N+1).
     linked = get_evaluators_for_annotation_task(task_uuid)
+    evaluators_by_id = get_evaluators_by_uuids([stub["uuid"] for stub in linked])
+    versions_by_evaluator = get_evaluator_versions_for_evaluators(
+        [stub["uuid"] for stub in linked]
+    )
+    live_version_by_id = get_evaluator_versions_by_uuids(
+        [
+            ev["live_version_id"]
+            for ev in evaluators_by_id.values()
+            if ev.get("live_version_id")
+        ]
+    )
     out: List[EvaluatorDetailResponse] = []
     for stub in linked:
-        ev = get_evaluator(stub["uuid"])
+        ev = evaluators_by_id.get(stub["uuid"])
         if not ev:
             continue
-        base = _evaluator_response(ev)
+        base = _evaluator_response(ev, version_by_id=live_version_by_id)
         ev_output_type = ev.get("output_type", "binary")
         versions = [
             EvaluatorVersionResponse(**_version_dict(v, ev_output_type))
-            for v in get_evaluator_versions(ev["uuid"])
+            for v in versions_by_evaluator.get(ev["uuid"], [])
         ]
         out.append(
             EvaluatorDetailResponse(
