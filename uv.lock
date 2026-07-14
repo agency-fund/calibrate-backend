@@ -431,7 +431,7 @@ wheels = [
 
 [[package]]
 name = "calibrate-agent"
-version = "0.0.60"
+version = "0.0.61"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "backoff" },
@@ -460,9 +460,9 @@ dependencies = [
     { name = "uvicorn" },
     { name = "whisper-normalizer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/24/78/96df8d89fea7cc596ad833c05319a3ade87b4ae7791cae46a7cce8c5e419/calibrate_agent-0.0.60.tar.gz", hash = "sha256:2d6514e7c5d06ceaa51eaaa164b528ca454e7a00173c47b17c9ce92410ce7fa0", size = 18674344, upload-time = "2026-07-11T09:56:49.724Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/04/67/0443ac5c46890ec5702a82a0aeb1a0ecb014e0236a35ddb7fd8b46b5f544/calibrate_agent-0.0.61.tar.gz", hash = "sha256:c43d190e1dee6f676e9433ad9224fd53d26ee0fee2ecff78c4cfd8635dccd122", size = 18689745, upload-time = "2026-07-14T01:21:51.351Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/47/36f8edcebf3351d2420ddae796c038d7d8aca5a8cc7505d3374619350186/calibrate_agent-0.0.60-py3-none-any.whl", hash = "sha256:f00cafd1f9c3c2cd9308a4d17bde750a7ceafc0d7c7d5777a3cc1e6ab14c05f3", size = 810784, upload-time = "2026-07-11T09:56:47.929Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/05/f9a1659754fb80e5ba13b19dd3c834f2796b6b05480616c42e3dc75f49dc/calibrate_agent-0.0.61-py3-none-any.whl", hash = "sha256:e3a758b587e02a3d3e0f9d37a936e585a6c08c89baa5aaa62437c8ba88f9ebbd", size = 821183, upload-time = "2026-07-14T01:21:48.542Z" },
 ]
 
 [[package]]
