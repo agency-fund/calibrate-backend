@@ -327,6 +327,47 @@ def test_download_file_from_s3_s3_mode(monkeypatch):
     )
 
 
+def test_download_file_from_s3_local_missing_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("OBJECT_STORAGE_MODE", "local")
+    monkeypatch.setenv("LOCAL_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    # Nothing uploaded → a genuine "missing" surfaces as FileNotFoundError,
+    # not a silent empty copy.
+    with pytest.raises(FileNotFoundError, match="tts/media/nope.wav"):
+        download_file_from_s3(
+            None, "local-dev-artifacts", "tts/media/nope.wav", tmp_path / "out.wav"
+        )
+
+
+def test_normalize_stored_audio_path():
+    from utils import normalize_stored_audio_path
+
+    assert normalize_stored_audio_path(None) is None
+    assert normalize_stored_audio_path("") == ""
+    # s3:// URIs pass through untouched (no leading slash to strip).
+    assert normalize_stored_audio_path("s3://b/tts/media/a.wav") == "s3://b/tts/media/a.wav"
+    # A bare key is returned as-is; a leading slash and surrounding whitespace
+    # are trimmed.
+    assert normalize_stored_audio_path("tts/media/a.wav") == "tts/media/a.wav"
+    assert normalize_stored_audio_path("/tts/media/a.wav") == "tts/media/a.wav"
+    assert normalize_stored_audio_path("  tts/media/a.wav  ") == "tts/media/a.wav"
+
+
+def test_resolve_stored_audio_bucket_and_key(monkeypatch):
+    from utils import resolve_stored_audio_bucket_and_key
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "out-bucket")
+    monkeypatch.delenv("OBJECT_STORAGE_MODE", raising=False)
+    # s3:// splits into bucket + key.
+    assert resolve_stored_audio_bucket_and_key("s3://b/tts/media/a.wav") == ("b", "tts/media/a.wav")
+    # s3:// with no key.
+    assert resolve_stored_audio_bucket_and_key("s3://b") == ("b", "")
+    # A bare key resolves against the configured output bucket.
+    assert resolve_stored_audio_bucket_and_key("tts/media/a.wav") == ("out-bucket", "tts/media/a.wav")
+    # An external URL is not a storage location.
+    with pytest.raises(ValueError):
+        resolve_stored_audio_bucket_and_key("https://cdn.example/audio.mp3")
+
+
 def test_list_object_keys_local(monkeypatch, tmp_path):
     monkeypatch.setenv("OBJECT_STORAGE_MODE", "local")
     monkeypatch.setenv("LOCAL_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
@@ -422,6 +463,39 @@ def test_presign_audio_path_branches(monkeypatch):
         assert presign_audio_path("https://already.example/x") == "https://already.example/x"
         assert presign_audio_path("s3://bucket/key.wav") == fake_url
         assert presign_audio_path("raw-key.wav") == fake_url
+        # Normalizes to an empty key → nothing to sign, returned as-is.
+        assert presign_audio_path("/") == "/"
+
+
+def test_presign_annotation_items_audio(monkeypatch):
+    from utils import (
+        ANNOTATION_AUDIO_URL_EXPIRY_SECONDS,
+        presign_annotation_items_audio,
+    )
+
+    monkeypatch.setenv("S3_OUTPUT_BUCKET", "my-bucket")
+    fake_url = "https://example.com/signed"
+    s3_mock = MagicMock()
+    s3_mock.generate_presigned_url.return_value = fake_url
+    with patch("utils.get_s3_client", return_value=s3_mock):
+        # Non-tts task → left untouched (no-op) even when audio is present.
+        stt_items = [{"payload": {"name": "x", "audio_path": "s3://b/a.wav"}}]
+        presign_annotation_items_audio(stt_items, "stt")
+        assert stt_items[0]["payload"]["audio_path"] == "s3://b/a.wav"
+
+        # tts task → audio_path signed in place; items without audio untouched.
+        tts_items = [
+            {"payload": {"name": "clip", "audio_path": "s3://b/a.wav"}},
+            {"payload": {"name": "no-audio"}},
+            {"payload": None},
+        ]
+        returned = presign_annotation_items_audio(tts_items, "tts")
+        assert returned is tts_items  # mutates + returns the same list
+        assert tts_items[0]["payload"]["audio_path"] == fake_url
+        assert "audio_path" not in tts_items[1]["payload"]
+        # Long TTL passed through so annotator sessions don't expire mid-play.
+        _, kwargs = s3_mock.generate_presigned_url.call_args
+        assert kwargs["ExpiresIn"] == ANNOTATION_AUDIO_URL_EXPIRY_SECONDS
 
 
 # ---------------------------------------------------------------------------

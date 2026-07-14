@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -187,6 +188,144 @@ def test_annotation_task_crud(client):
     deleted = client.delete(f"/annotation-tasks/{task_uuid}", headers=h)
     assert deleted.status_code == 200
     assert client.delete(f"/annotation-tasks/{task_uuid}", headers=h).status_code == 404
+
+
+def _tts_evaluator(client, h):
+    evaluators = client.get("/evaluators", headers=h).json()["items"]
+    return next(e for e in evaluators if e.get("evaluator_type") == "tts")
+
+
+def test_tts_task_type_evaluator_run_launches(client, monkeypatch):
+    """`tts` tasks accept evaluator runs once items carry `text` + `audio_path`."""
+    auth = _signup(client)
+    h = auth["headers"]
+    tts_ev = _tts_evaluator(client, h)
+
+    name = f"tts-task-{uuid.uuid4().hex[:6]}"
+    create = client.post(
+        "/annotation-tasks",
+        json={"name": name, "type": "tts", "evaluator_ids": [tts_ev["uuid"]]},
+        headers=h,
+    )
+    assert create.status_code == 200
+    task_uuid = create.json()["uuid"]
+
+    item_ids = client.post(
+        f"/annotation-tasks/{task_uuid}/items",
+        json={
+            "items": [
+                {
+                    "payload": {
+                        "name": "clip-1",
+                        "text": "Hello world",
+                        "audio_path": "s3://test-bucket/tts/media/abc.wav",
+                    }
+                }
+            ]
+        },
+        headers=h,
+    ).json()["item_ids"]
+
+    monkeypatch.setenv("FAKE_AI_PROVIDERS", "1")
+    with patch(
+        "annotation_eval_runner.download_file_from_s3",
+        side_effect=lambda _s3, _b, _k, local: Path(local).write_bytes(b"wav"),
+    ):
+        run = client.post(
+            f"/annotation-tasks/{task_uuid}/evaluator-runs",
+            json={
+                "evaluators": [{"evaluator_id": tts_ev["uuid"]}],
+                "item_ids": item_ids,
+            },
+            headers=h,
+        )
+    assert run.status_code == 200, run.text
+    body = run.json()
+    assert body["evaluator_count"] == 1
+    assert body["item_count"] == 1
+    assert body["status"] in ("in_progress", "queued")
+
+
+def test_tts_evaluator_run_requires_text_and_audio_path(client):
+    """TTS evaluator runs 400 when items lack `text` or `audio_path`."""
+    auth = _signup(client)
+    h = auth["headers"]
+    tts_ev = _tts_evaluator(client, h)
+    task_uuid = client.post(
+        "/annotation-tasks",
+        json={
+            "name": f"tts-{uuid.uuid4().hex[:6]}",
+            "type": "tts",
+            "evaluator_ids": [tts_ev["uuid"]],
+        },
+        headers=h,
+    ).json()["uuid"]
+    item_ids = client.post(
+        f"/annotation-tasks/{task_uuid}/items",
+        json={"items": [{"payload": {"name": "clip-1"}}]},
+        headers=h,
+    ).json()["item_ids"]
+
+    run = client.post(
+        f"/annotation-tasks/{task_uuid}/evaluator-runs",
+        json={
+            "evaluators": [{"evaluator_id": tts_ev["uuid"]}],
+            "item_ids": item_ids,
+        },
+        headers=h,
+    )
+    assert run.status_code == 400
+    assert "text" in run.json()["detail"] and "audio_path" in run.json()["detail"]
+
+
+def test_tts_item_audio_path_signed_on_reads(client):
+    """TTS items store `audio_path` as an S3 key; every read path signs it into a
+    presigned URL so the clip plays — including the unauthenticated public
+    labelling form."""
+    auth = _signup(client)
+    h = auth["headers"]
+    tts_ev = _tts_evaluator(client, h)
+    task_uuid = client.post(
+        "/annotation-tasks",
+        json={
+            "name": f"tts-{uuid.uuid4().hex[:6]}",
+            "type": "tts",
+            "evaluator_ids": [tts_ev["uuid"]],
+        },
+        headers=h,
+    ).json()["uuid"]
+    item_ids = client.post(
+        f"/annotation-tasks/{task_uuid}/items",
+        json={
+            "items": [
+                {"payload": {"name": "clip", "audio_path": "s3://test-bucket/tts/media/abc.wav"}}
+            ]
+        },
+        headers=h,
+    ).json()["item_ids"]
+
+    signed = "https://signed.example/audio"
+    with patch("utils.generate_presigned_download_url", return_value=signed):
+        # Admin: task detail (Items tab).
+        detail = client.get(f"/annotation-tasks/{task_uuid}", headers=h).json()
+        assert detail["items"][0]["payload"]["audio_path"] == signed
+
+        # Admin: summary rows (item detail dialog).
+        summ = client.get(f"/annotation-tasks/{task_uuid}/summary", headers=h).json()
+        assert summ["rows"][0]["payload"]["audio_path"] == signed
+
+        # Annotator: unauthenticated public labelling form (no bearer).
+        annotator = client.post(
+            "/annotators", json={"name": f"a-{uuid.uuid4().hex[:6]}"}, headers=h
+        ).json()
+        job = client.post(
+            f"/annotation-tasks/{task_uuid}/jobs",
+            json={"annotator_ids": [annotator["uuid"]], "item_ids": item_ids},
+            headers=h,
+        ).json()["jobs"][0]
+        form = client.get(f"/public/annotation-jobs/{job['public_token']}")
+        assert form.status_code == 200
+        assert form.json()["items"][0]["payload"]["audio_path"] == signed
 
 
 def test_list_annotation_tasks_batched_evaluators_match_per_task(client):
@@ -1928,17 +2067,12 @@ def test_annotation_eval_llm_general_payload_validation(client):
     assert "input" in resp.json()["detail"]
 
 
-def test_annotation_eval_supported_task_types_cover_all_creatable_types():
-    """Every creatable annotation task type must be eval-run supported, so the
-    unsupported-type 400 guard in the evaluator-runs endpoint is defensive-only
-    and can't be hit through a real task. (tts was the last creatable-but-
-    unsupported type and is no longer a valid annotation task type.)"""
+def test_annotation_eval_supported_task_types_match_creatable():
+    """Every creatable annotation task type has a wired evaluator-run path."""
     import db as db_mod
     from annotation_eval_runner import SUPPORTED_EVAL_TASK_TYPES
 
-    assert "tts" not in db_mod.ANNOTATION_TASK_TYPES
-    unsupported = set(db_mod.ANNOTATION_TASK_TYPES) - set(SUPPORTED_EVAL_TASK_TYPES)
-    assert unsupported == set(), f"creatable task types with no eval support: {unsupported}"
+    assert set(db_mod.ANNOTATION_TASK_TYPES) == set(SUPPORTED_EVAL_TASK_TYPES)
 
 
 def test_annotation_task_summary_pagination(client):

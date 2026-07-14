@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, List, Literal, Optional, Dict, Any, Union
+from typing import Annotated, List, Literal, Optional, Dict, Any, Union, Tuple
 from urllib.parse import quote
 
 import boto3
@@ -200,7 +200,7 @@ AgentTestJobType = Literal["llm-unit-test", "llm-benchmark"]
 EvalJobType = Literal["stt-eval", "tts-eval", "annotation-eval"]
 # Keep in sync with db.ANNOTATION_TASK_TYPES and db.VALID_EVALUATOR_TYPES
 # (Literal requires literal members, so the vocabulary is mirrored here).
-AnnotationTaskTypeLiteral = Literal["stt", "llm", "llm-general", "conversation"]
+AnnotationTaskTypeLiteral = Literal["stt", "llm", "llm-general", "conversation", "tts"]
 TestTypeLiteral = Literal["response", "tool_call", "conversation"]
 MemberRoleLiteral = Literal["owner", "admin"]  # mirrors DB CHECK(role IN ('owner','admin'))
 EvaluatorUuid = Annotated[str, StringConstraints(min_length=36, max_length=36)]
@@ -518,6 +518,13 @@ def get_s3_client():
 
 LOCAL_STORAGE_BUCKET = "local-dev-artifacts"
 
+# URL path prefix for the dev-mode local object-storage stand-in. In local mode
+# (`OBJECT_STORAGE_MODE=local`) there is no S3 — files are served/uploaded via
+# `GET/PUT {LOCAL_ARTIFACTS_URL_PREFIX}<key>` (see the route in main.py). The
+# download-URL builder and the audio-path normalizer both key off this, so it
+# lives here as the single source of truth.
+LOCAL_ARTIFACTS_URL_PREFIX = "/local-artifacts/"
+
 
 def get_object_storage_mode() -> str:
     """Return the configured artifact storage mode.
@@ -556,7 +563,7 @@ def get_local_artifact_path(key: str) -> Path:
 
 def get_local_artifact_url(key: str) -> str:
     path = quote(key.lstrip("/"), safe="/")
-    relative_url = f"/local-artifacts/{path}"
+    relative_url = f"{LOCAL_ARTIFACTS_URL_PREFIX}{path}"
     base_url = os.getenv("LOCAL_ARTIFACT_BASE_URL")
     if not base_url:
         return relative_url
@@ -618,6 +625,11 @@ def download_file_from_s3(
     """
     if is_local_object_storage():
         source = get_local_artifact_path(s3_key)
+        if not source.is_file():
+            raise FileNotFoundError(
+                f"Audio file not found for storage key {s3_key!r} "
+                f"(expected at {source}). Upload the file before running evaluators."
+            )
         Path(local_path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, local_path)
         return
@@ -724,18 +736,88 @@ def generate_presigned_download_url(
         return None
 
 
-def presign_audio_path(audio_path: Optional[str]) -> Optional[str]:
+def normalize_stored_audio_path(audio_path: Optional[str]) -> Optional[str]:
+    """Trim a persisted audio reference to a canonical storage reference.
+
+    Annotation items store either a bare key (``tts/media/<uuid>.wav``) or an
+    ``s3://bucket/key`` URI — exactly what ``POST /presigned-url`` returns. Just
+    strip surrounding whitespace and any leading slash; an ``s3://`` URI is left
+    intact (it has no leading slash to strip)."""
+    if not audio_path:
+        return audio_path
+    return str(audio_path).strip().lstrip("/")
+
+
+def resolve_stored_audio_bucket_and_key(audio_path: str) -> Tuple[str, str]:
+    """Parse a normalized or raw stored audio reference into (bucket, key)."""
+    normalized = normalize_stored_audio_path(audio_path) or ""
+    if normalized.startswith("s3://"):
+        parts = normalized[5:].split("/", 1)
+        bucket = parts[0]
+        key = parts[1] if len(parts) > 1 else ""
+        return bucket, key
+    if normalized.startswith("http://") or normalized.startswith("https://"):
+        raise ValueError(
+            "audio_path must be a storage key or s3:// URI, not an external URL"
+        )
+    return get_s3_output_config(), normalized
+
+
+def presign_audio_path(
+    audio_path: Optional[str],
+    expiration: int = PRESIGNED_URL_EXPIRY_SECONDS,
+) -> Optional[str]:
     """Convert an s3://bucket/key path (or plain key) to a presigned download URL."""
     if not audio_path:
         return audio_path
-    if audio_path.startswith("s3://"):
-        parts = audio_path[5:].split("/", 1)
-        bucket = parts[0]
-        key = parts[1] if len(parts) > 1 else ""
-        return generate_presigned_download_url(key, bucket=bucket) or audio_path
-    if audio_path.startswith("http"):
+    normalized = normalize_stored_audio_path(audio_path)
+    # An external URL is already fetchable — pass it through. This also keeps
+    # resolve_stored_audio_bucket_and_key below from seeing one (it would raise).
+    if normalized and (
+        normalized.startswith("http://") or normalized.startswith("https://")
+    ):
+        return normalized
+    bucket, key = resolve_stored_audio_bucket_and_key(audio_path)
+    if not key:
         return audio_path
-    return generate_presigned_download_url(audio_path) or audio_path
+    return (
+        generate_presigned_download_url(key, bucket=bucket, expiration=expiration)
+        or audio_path
+    )
+
+
+# Long TTL for audio playback URLs handed to annotation reads. Unauthenticated
+# annotators (public labelling / view routes) may keep a labelling job open for
+# a whole work session, so a 1-hour URL would expire mid-session and break
+# playback. 12h comfortably covers a working day and stays well under S3
+# SigV4's 7-day presign ceiling.
+ANNOTATION_AUDIO_URL_EXPIRY_SECONDS = 12 * 3600
+
+
+def presign_annotation_items_audio(
+    items: List[Dict[str, Any]],
+    task_type: Optional[str],
+    expiration: int = ANNOTATION_AUDIO_URL_EXPIRY_SECONDS,
+) -> List[Dict[str, Any]]:
+    """For a `tts` annotation task, replace each item's stored `payload.audio_path`
+    (an S3 key/URI, never a persisted signed URL) with a freshly presigned
+    download URL so the clip plays in the browser.
+
+    Mutates the item payloads in place and returns the same list. No-op for
+    non-tts tasks or items whose payload carries no `audio_path`, so it is safe
+    to call on every annotation-item read path. Signing on read (rather than
+    storing a URL) keeps frozen evaluator-run snapshots replayable — the key
+    never expires, only the URL minted per request does.
+    """
+    if task_type != "tts":
+        return items
+    for item in items:
+        payload = item.get("payload") if isinstance(item, dict) else None
+        if isinstance(payload, dict) and payload.get("audio_path"):
+            payload["audio_path"] = presign_audio_path(
+                payload["audio_path"], expiration=expiration
+            )
+    return items
 
 
 def generate_presigned_upload_url(
