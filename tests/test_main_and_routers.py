@@ -1527,6 +1527,78 @@ def test_jobs_router(client):
     assert client.delete(f"/jobs/{j_uuid}", headers=h).status_code == 404
 
 
+def test_jobs_bulk_delete(client):
+    import db as db_mod
+
+    auth = _auth(client)
+    h = auth["headers"]
+    org_uuid = db_mod.get_personal_org_for_user(auth["user_uuid"])["uuid"]
+
+    done = db_mod.create_job(
+        job_type="stt-eval", org_uuid=org_uuid, user_id=auth["user_uuid"],
+        status="done",
+    )
+    failed = db_mod.create_job(
+        job_type="tts-eval", org_uuid=org_uuid, user_id=auth["user_uuid"],
+        status="failed",
+    )
+    running = db_mod.create_job(
+        job_type="stt-eval", org_uuid=org_uuid, user_id=auth["user_uuid"],
+        status="in_progress",
+    )
+    queued = db_mod.create_job(
+        job_type="stt-eval", org_uuid=org_uuid, user_id=auth["user_uuid"],
+        status="queued",
+    )
+    missing = str(uuid.uuid4())
+
+    # Strict / all-or-nothing: one unfinished (or unknown) ID rejects the whole
+    # batch and deletes nothing.
+    reject = client.request(
+        "DELETE",
+        "/jobs",
+        headers=h,
+        json={"job_uuids": [done, failed, running, queued, missing]},
+    )
+    assert reject.status_code == 400
+    detail = reject.json()["detail"]
+    assert sorted(detail["active"]) == sorted([running, queued])
+    assert detail["not_found"] == [missing]
+    # Nothing was deleted — every job still present
+    for j in (done, failed, running, queued):
+        assert db_mod.get_job(j, org_uuid=org_uuid) is not None
+
+    # All-finished batch succeeds; `done` repeated proves duplicate IDs de-dupe
+    ok = client.request(
+        "DELETE", "/jobs", headers=h, json={"job_uuids": [done, failed, done]}
+    )
+    assert ok.status_code == 200
+    assert ok.json() == {"deleted_count": 2}
+    assert db_mod.get_job(done, org_uuid=org_uuid) is None
+    assert db_mod.get_job(failed, org_uuid=org_uuid) is None
+
+    # Another org's finished job reads as not-found and rejects the batch
+    other = _auth(client)
+    j_other = db_mod.create_job(
+        job_type="stt-eval", org_uuid=org_uuid, user_id=auth["user_uuid"],
+        status="done",
+    )
+    cross = client.request(
+        "DELETE", "/jobs", headers=other["headers"], json={"job_uuids": [j_other]}
+    )
+    assert cross.status_code == 400
+    assert cross.json()["detail"]["not_found"] == [j_other]
+    assert db_mod.get_job(j_other, org_uuid=org_uuid) is not None
+
+    # Empty list is rejected by validation
+    assert (
+        client.request(
+            "DELETE", "/jobs", headers=h, json={"job_uuids": []}
+        ).status_code
+        == 422
+    )
+
+
 # ---------------------------------------------------------------------------
 # Agent-Tools router
 # ---------------------------------------------------------------------------

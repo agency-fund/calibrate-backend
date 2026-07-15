@@ -4,7 +4,13 @@ from enum import Enum
 from fastapi import APIRouter, Query, Depends, HTTPException, Path
 from pydantic import BaseModel, Field
 
-from db import get_all_jobs, get_job, delete_job, get_active_dataset_ids
+from db import (
+    get_all_jobs,
+    get_job,
+    delete_job,
+    bulk_delete_finished_jobs,
+    get_active_dataset_ids,
+)
 from auth_utils import get_current_org, OrgContext
 from utils import (
     TaskStatus,
@@ -104,6 +110,40 @@ async def list_jobs(
         )
 
     return JobsListResponse(jobs=job_items)
+
+
+class BulkDeleteJobsRequest(BaseModel):
+    job_uuids: List[str] = Field(
+        min_length=1,
+        description="Jobs to delete",
+    )
+
+
+class BulkDeleteJobsResponse(BaseModel):
+    deleted_count: int = Field(description="Number of jobs deleted")
+
+
+@router.delete("", response_model=BulkDeleteJobsResponse, summary="Bulk delete jobs")
+async def bulk_delete_jobs_endpoint(
+    payload: BulkDeleteJobsRequest = ...,
+    ctx: OrgContext = Depends(get_current_org),
+):
+    """Delete several finished jobs at once, rejecting the batch if any is unfinished or unknown"""
+    unique_uuids = list(dict.fromkeys(payload.job_uuids))
+    result = bulk_delete_finished_jobs(unique_uuids, ctx.org_uuid)
+    if result["active"] or result["not_found"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    "No jobs were deleted. Every job must be finished "
+                    "(done or failed) and belong to this workspace."
+                ),
+                "active": result["active"],
+                "not_found": result["not_found"],
+            },
+        )
+    return BulkDeleteJobsResponse(deleted_count=len(result["deleted"]))
 
 
 @router.delete("/{job_uuid}", summary="Delete job")

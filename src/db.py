@@ -6371,6 +6371,50 @@ def delete_job(job_uuid: str) -> bool:
         return deleted
 
 
+# Bulk delete only targets jobs that have already ended, so it never needs to
+# kill a process group or re-trigger the eval queue (unlike single-job delete).
+FINISHED_JOB_STATUSES = ("done", "failed")
+
+
+def bulk_delete_finished_jobs(
+    job_uuids: List[str], org_uuid: str
+) -> Dict[str, List[str]]:
+    """Delete an org's jobs, but only if every requested ID is finished and present.
+
+    Bulk delete is all-or-nothing: if any requested job is still queued or
+    in progress, or is unknown to this org, NOTHING is deleted and the
+    offending IDs are returned (`active` / `not_found`) so the caller can
+    reject the batch. Only when all requested jobs are done/failed does the
+    single batched DELETE run. Returns `{deleted, active, not_found}`.
+    """
+    if not job_uuids:
+        return {"deleted": [], "active": [], "not_found": []}
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        placeholders = ",".join("?" for _ in job_uuids)
+        cursor.execute(
+            f"SELECT uuid, status FROM jobs "
+            f"WHERE uuid IN ({placeholders}) AND org_uuid = ? AND deleted_at IS NULL",
+            (*job_uuids, org_uuid),
+        )
+        status_by_uuid = {row["uuid"]: row["status"] for row in cursor.fetchall()}
+        not_found = [u for u in job_uuids if u not in status_by_uuid]
+        active = [
+            u for u in job_uuids
+            if u in status_by_uuid and status_by_uuid[u] not in FINISHED_JOB_STATUSES
+        ]
+        if not_found or active:
+            return {"deleted": [], "active": active, "not_found": not_found}
+
+        cursor.execute(
+            f"DELETE FROM jobs WHERE uuid IN ({placeholders})",
+            tuple(job_uuids),
+        )
+        conn.commit()
+        logger.info(f"Bulk-deleted {len(job_uuids)} finished jobs for org {org_uuid}")
+    return {"deleted": list(job_uuids), "active": [], "not_found": []}
+
+
 # ============ Agent Test Jobs Functions ============
 
 
