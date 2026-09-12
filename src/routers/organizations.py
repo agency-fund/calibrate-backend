@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 from auth_utils import get_current_user_id, is_superadmin_user
+from mailer import WORKSPACE_INVITE_TEMPLATE, frontend_url, send_email
 from utils import MemberRoleLiteral
 from db import (
     add_organization_member,
@@ -18,6 +19,7 @@ from db import (
     get_org_by_invite_token,
     get_org_invite,
     get_organization,
+    get_user,
     list_organization_members,
     list_organizations_for_user,
     remove_organization_member,
@@ -86,6 +88,27 @@ class MemberResponse(BaseModel):
         description="Member's role in the workspace"
     )
     created_at: str = Field(description="When the member was added (ISO 8601 UTC)")
+
+
+def _send_added_to_workspace_email(
+    email: str, org_uuid: str, org_name: str, inviter: dict
+) -> None:
+    """Tell someone they are in. They are already a member, so the link lands
+    them in the workspace; a signed-out reader is bounced to login and back."""
+    who = (
+        f"{inviter.get('first_name') or ''} {inviter.get('last_name') or ''}".strip()
+        or inviter.get("email")
+        or ""
+    )
+    send_email(
+        to=email,
+        template=WORKSPACE_INVITE_TEMPLATE,
+        variables={
+            "INVITER": who,
+            "WORKSPACE": org_name,
+            "URL": f"{frontend_url()}/{org_uuid}/agents",
+        },
+    )
 
 
 def _require_membership(org_uuid: str, user_id: str) -> str:
@@ -170,6 +193,13 @@ def add_member(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    _send_added_to_workspace_email(
+        email=member["email"],
+        org_uuid=org_uuid,
+        org_name=get_organization(org_uuid)["name"],
+        inviter=get_user(user_id),
+    )
 
     # Re-read the full member row so the response has the joined user fields.
     for m in list_organization_members(org_uuid):

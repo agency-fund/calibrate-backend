@@ -17,6 +17,8 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from mailer import WORKSPACE_INVITE_TEMPLATE
+
 
 @pytest.fixture(scope="module")
 def app():
@@ -552,3 +554,163 @@ def test_create_org_invite_returns_nothing_for_an_unknown_workspace():
     assert create_org_invite(missing) is None
     assert get_org_invite(missing) is None
     revoke_org_invite(missing)
+
+
+@pytest.fixture
+def sent_emails(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        "routers.organizations.send_email",
+        lambda to, template, variables: sent.append(
+            {"to": to, "template": template, "variables": variables}
+        ),
+    )
+    monkeypatch.setattr("routers.organizations.frontend_url", lambda: "https://app.example.com")
+    return sent
+
+
+def test_adding_someone_emails_them_a_link_into_the_workspace(client, sent_emails):
+    owner = _signup(client, "mail-owner")
+    org_uuid = _new_org(client, owner, name="Mail Co")
+    invitee = f"nobody-{uuid.uuid4().hex[:8]}@example.com"
+
+    resp = client.post(
+        f"/organizations/{org_uuid}/members",
+        json={"email": invitee},
+        headers=owner["headers"],
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert len(sent_emails) == 1
+    mail = sent_emails[0]
+    assert mail["to"] == invitee
+    assert mail["template"] == WORKSPACE_INVITE_TEMPLATE
+    assert mail["variables"]["WORKSPACE"] == "Mail Co"
+    assert mail["variables"]["URL"] == f"https://app.example.com/{org_uuid}/agents"
+    assert mail["variables"]["INVITER"] == "O U"
+
+
+def test_someone_who_already_has_an_account_gets_the_same_email(client, sent_emails):
+    """The person is a member either way, so both cases read alike and land alike."""
+    owner = _signup(client, "mail-owner2")
+    member = _signup(client, "mail-invitee")
+    org_uuid = _new_org(client, owner, name="Mail Co Two")
+
+    resp = client.post(
+        f"/organizations/{org_uuid}/members",
+        json={"email": member["email"]},
+        headers=owner["headers"],
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert len(sent_emails) == 1
+    mail = sent_emails[0]
+    assert mail["to"] == member["email"]
+    assert mail["template"] == WORKSPACE_INVITE_TEMPLATE
+    assert mail["variables"]["WORKSPACE"] == "Mail Co Two"
+    assert mail["variables"]["URL"] == f"https://app.example.com/{org_uuid}/agents"
+
+
+def test_a_second_workspace_links_to_that_second_workspace(client, sent_emails):
+    first = _signup(client, "mail-owner3")
+    second = _signup(client, "mail-owner4")
+    invitee = f"stubmail-{uuid.uuid4().hex[:8]}@example.com"
+
+    first_org = _new_org(client, first, name="First Co")
+    second_org = _new_org(client, second, name="Second Co")
+    client.post(
+        f"/organizations/{first_org}/members",
+        json={"email": invitee},
+        headers=first["headers"],
+    )
+    client.post(
+        f"/organizations/{second_org}/members",
+        json={"email": invitee},
+        headers=second["headers"],
+    )
+
+    assert len(sent_emails) == 2
+    assert sent_emails[0]["variables"]["URL"] == f"https://app.example.com/{first_org}/agents"
+    assert sent_emails[1]["variables"]["WORKSPACE"] == "Second Co"
+    assert sent_emails[1]["variables"]["URL"] == f"https://app.example.com/{second_org}/agents"
+
+
+def test_a_failed_add_sends_nothing(client, sent_emails):
+    owner = _signup(client, "mail-owner5")
+    member = _signup(client, "mail-invitee2")
+    org_uuid = _new_org(client, owner, name="Dup Co")
+
+    client.post(
+        f"/organizations/{org_uuid}/members",
+        json={"email": member["email"]},
+        headers=owner["headers"],
+    )
+    sent_emails.clear()
+
+    dup = client.post(
+        f"/organizations/{org_uuid}/members",
+        json={"email": member["email"]},
+        headers=owner["headers"],
+    )
+    assert dup.status_code == 400
+    assert sent_emails == []
+
+
+def test_names_reach_the_mailer_unescaped(client, sent_emails, monkeypatch):
+    """The mailer strips markup itself, so escaping here would put `&amp;` in the
+    subject the template renders."""
+    owner = _signup(client, "mail-owner6")
+    org_uuid = _new_org(client, owner, name="Tom & Jerry <Labs>")
+    monkeypatch.setattr(
+        "routers.organizations.get_user",
+        lambda _: {"first_name": "Ann & <b>Bo</b>", "last_name": "O'Neil"},
+    )
+    invitee = f"plus+tag-{uuid.uuid4().hex[:8]}@example.com"
+
+    resp = client.post(
+        f"/organizations/{org_uuid}/members",
+        json={"email": invitee},
+        headers=owner["headers"],
+    )
+    assert resp.status_code == 201, resp.text
+
+    variables = sent_emails[0]["variables"]
+    assert variables["WORKSPACE"] == "Tom & Jerry <Labs>"
+    assert variables["INVITER"] == "Ann & <b>Bo</b> O'Neil"
+    assert "&amp;" not in variables["WORKSPACE"]
+    assert "&amp;" not in variables["INVITER"]
+    assert variables["URL"] == f"https://app.example.com/{org_uuid}/agents"
+
+
+def test_the_invite_goes_to_the_tidied_up_address(client, sent_emails):
+    """A stray space or capital letter must not reach the mail provider."""
+    owner = _signup(client, "mail-owner7")
+    org_uuid = _new_org(client, owner, name="Padded")
+    invitee = f"Mixed-{uuid.uuid4().hex[:8]}@Example.COM"
+
+    resp = client.post(
+        f"/organizations/{org_uuid}/members",
+        json={"email": f"  {invitee}  "},
+        headers=owner["headers"],
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert [m["to"] for m in sent_emails] == [invitee.lower()]
+
+
+def test_inviter_falls_back_to_their_email_when_they_have_no_name(
+    client, sent_emails, monkeypatch
+):
+    owner = _signup(client, "mail-owner8")
+    org_uuid = _new_org(client, owner, name="Nameless")
+    monkeypatch.setattr(
+        "routers.organizations.get_user", lambda _: {"email": "boss@example.com"}
+    )
+
+    resp = client.post(
+        f"/organizations/{org_uuid}/members",
+        json={"email": f"fallback-{uuid.uuid4().hex[:8]}@example.com"},
+        headers=owner["headers"],
+    )
+    assert resp.status_code == 201, resp.text
+    assert sent_emails[0]["variables"]["INVITER"] == "boss@example.com"
